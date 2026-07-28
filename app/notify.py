@@ -56,6 +56,25 @@ def _parse_headers(headers_text: str) -> dict[str, str]:
     return out
 
 
+def _render_template_value(value, title: str, content: str):
+    """Render placeholders after JSON parsing so multiline text stays valid JSON."""
+    if isinstance(value, str):
+        return value.replace("${title}", title).replace("${content}", content)
+    if isinstance(value, list):
+        return [_render_template_value(item, title, content) for item in value]
+    if isinstance(value, dict):
+        return {key: _render_template_value(item, title, content) for key, item in value.items()}
+    return value
+
+
+def _render_body_template(body_tpl: str, title: str, content: str):
+    try:
+        template_data = json.loads(body_tpl)
+    except (TypeError, json.JSONDecodeError):
+        return body_tpl.replace("${title}", title).replace("${content}", content)
+    return _render_template_value(template_data, title, content)
+
+
 def send_custom_webhook(
     webhook_url: str,
     content: str,
@@ -84,11 +103,7 @@ def send_custom_webhook(
 
     body_tpl = get_setting("custom_webhook_body", "") or ""
     if body_tpl:
-        rendered = body_tpl.replace("${title}", title_str).replace("${content}", content_str)
-        try:
-            body_data = json.loads(rendered)
-        except Exception:
-            body_data = rendered
+        body_data = _render_body_template(body_tpl, title_str, content_str)
     else:
         body_data = payload
 
