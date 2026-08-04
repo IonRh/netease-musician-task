@@ -28,10 +28,24 @@ from app.browser.helpers import (
     try_click_if_visible,
 )
 from app.browser.manager import run_with_context
+from app import repository as repo
 from app.account_identity import account_label, mask_phone
-from app.config import DEBUG_DIR, DEBUG_SCREENSHOT
+from app.config import DEBUG_DIR, DEBUG_SCREENSHOT, LOGIN_METHOD, LOGIN_METHODS
 from app.event_bus import bus
 from app.logging_conf import logger
+
+
+SECONDARY_WAIT_SECONDS = 180  # 二次验证总等待时长
+QR_RETRY_INTERVAL = 15  # 二维码迟迟拿不到时，每隔多少秒重试抓取一次
+# 拖动后轮询等待验证码消失的时长。真机实测（2026-07-30）：滑块通过后易盾要
+# 约 6.3s 才撤掉验证码，所以固定 sleep(2) 必然误判成失败。留一倍余量到 12s；
+# 这段等待只在滑块真的没过时才会全额付出，仍远小于原实现单次刷新点击的 30s。
+SLIDER_PASS_WAIT = 12
+SLIDER_REDRAW_WAIT = 8  # 每轮重试前等待易盾重建验证码的时长
+SLIDER_REFRESH_TIMEOUT = 5000  # 点「刷新」按钮的超时（ms），失败即视为验证码正在重建
+QRCODE_LOGIN_TIMEOUT = 300  # 扫码登录等待用户扫码的时长
+QRCODE_MAX_RELOAD = 3  # 扫码登录期间最多重新加载登录页的次数
+CONFIRM_WAIT_SECONDS = 60  # 等待服务端确认登录态的时长
 
 
 class NetworkRiskError(RuntimeError):
@@ -101,9 +115,40 @@ def _has_slider_modal(page: Page | Frame) -> bool:
     return False
 
 
+def _brief(exc: Exception, limit: int = 160) -> str:
+    """取异常首行。Playwright 的超时异常会带上整段 call log，
+    直接塞进日志会把界面刷屏（真实登录日志里就出现过几十行的 call log）。"""
+    text = str(exc).strip().splitlines()
+    head = text[0].strip() if text else exc.__class__.__name__
+    return head[:limit]
+
+
+def _wait_captcha_present(page: Page, timeout: float) -> bool:
+    """轮询等待滑块验证码图片就位。
+
+    失败一次后易盾会拆掉并重建整个验证码 iframe，重建期间 SEL_YIDUN_BG 短时为 0。
+    原实现在每轮重试开头直接遍历 scopes() 并 count()==0 就 continue，于是第 2、3 次
+    尝试在 0 秒内空转结束，3 次重试实际只滑了 1 次。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            for scope in scopes(page):
+                if scope.locator(S.SEL_YIDUN_BG).count() > 0:
+                    return True
+        except Exception:  # noqa: BLE001  frame 正在重建时 count() 可能抛错
+            pass
+        time.sleep(0.3)
+    return False
+
+
 # ---------- 滑块验证码 ----------
-def solve_slider(page: Page, account_id: Optional[int], max_retry: int = 3) -> None:
-    """网易云 yidun 滑块：ddddocr 优先 + OpenCV 兜底 + 人类轨迹拖动。"""
+def solve_slider(page: Page, account_id: Optional[int], max_retry: int = 3) -> bool:
+    """网易云 yidun 滑块：ddddocr 优先 + OpenCV 兜底 + 人类轨迹拖动。
+
+    返回 True 表示已通过或本来就没弹验证码，False 表示多次尝试后仍未通过
+    （供上层决定是否降级到扫码登录）。
+    """
     import cv2
     import numpy as np
     from ddddocr import DdddOcr
@@ -136,7 +181,12 @@ def solve_slider(page: Page, account_id: Optional[int], max_retry: int = 3) -> N
                 raise RuntimeError(f"滑块图尺寸异常：{w}x{h}")
         except Exception as e:
             _emit(account_id, f"图片尺寸校验失败，自动刷新验证码：{e}", "warn")
-            scope.locator(S.SEL_YIDUN_REFRESH).first.click()
+            try:
+                scope.locator(S.SEL_YIDUN_REFRESH).first.click(
+                    timeout=SLIDER_REFRESH_TIMEOUT
+                )
+            except Exception as click_err:  # noqa: BLE001  同上，不能用默认 30s 超时
+                _emit(account_id, f"[滑块] 刷新按钮不可点击：{_brief(click_err)}", "warn")
             time.sleep(1)
             raise RuntimeError(f"图片无效，已刷新：{e}")
         return resp.content
@@ -153,14 +203,27 @@ def solve_slider(page: Page, account_id: Optional[int], max_retry: int = 3) -> N
     if not modal_found:
         _ensure_no_network_risk(page, account_id, "确认无滑块弹窗前")
         _emit(account_id, "未触发验证码，跳过滑块验证")
-        return
+        return True
 
     ocr = DdddOcr(det=False, ocr=False, show_ad=False)
 
     for attempt in range(1, max_retry + 1):
         _emit(account_id, f"[滑块] 第 {attempt} 次尝试")
+        # 上一轮失败后易盾要重建验证码，这里等它重绘完再进 scopes()，
+        # 否则本轮会在 0 秒内空转、白白吃掉一次重试机会。
+        if not _wait_captcha_present(page, SLIDER_REDRAW_WAIT):
+            if not _has_slider_modal(page):
+                # 验证码弹窗整体消失：通常是服务端已放行、流程推进到下一步。
+                _emit(account_id, "[滑块] 验证码弹窗已消失，登录流程可能已推进")
+                return True
+            _emit(account_id, f"[滑块] 第 {attempt} 次等待验证码重绘超时", "warn")
+            continue
         for scope in scopes(page):
             try:
+                # 先用不带等待的 count() 排除掉不含验证码的 frame。
+                # 否则 wait_for_function 会在每个无关 frame 上死等满 timeout。
+                if scope.locator(S.SEL_YIDUN_BG).count() == 0:
+                    continue
                 wait_real_image(scope, S.SEL_YIDUN_BG)
                 wait_real_image(scope, S.SEL_YIDUN_JIGSAW, min_width=40)
 
@@ -214,15 +277,40 @@ def solve_slider(page: Page, account_id: Optional[int], max_retry: int = 3) -> N
                 time.sleep(0.05)
                 page.mouse.move(start_x + total, start_y, steps=2)
                 page.mouse.up()
-                time.sleep(2)
 
-                if scope.locator(S.SEL_YIDUN_SLIDER).count() == 0:
+                # 松手后服务端校验有网络延迟，验证码不会立刻消失。原实现只看
+                # time.sleep(2) 之后的那一瞬，服务端稍慢就误判成失败——真实登录里
+                # 滑块其实已通过并进入了安全验证，却被判为失败而降级扫码。
+                passed = False
+                deadline = time.time() + SLIDER_PASS_WAIT
+                while time.time() < deadline:
+                    try:
+                        if scope.locator(S.SEL_YIDUN_SLIDER).count() == 0:
+                            passed = True
+                            break
+                    except Exception:  # noqa: BLE001  验证码 iframe 被整体拆掉 = 已推进
+                        passed = True
+                        break
+                    time.sleep(0.4)
+
+                if passed:
                     _emit(account_id, "[滑块] 验证成功！")
-                    return
+                    return True
 
                 if attempt < max_retry:
                     _emit(account_id, f"[滑块] 第 {attempt} 次失败，刷新重试", "warn")
-                    scope.locator(S.SEL_YIDUN_REFRESH).first.click()
+                    # 验证失败后易盾常把刷新按钮隐藏并重建验证码，此时点不到属正常。
+                    # 原实现用默认 30s 超时，一次点击就烧掉了剩余两次重试的时间预算。
+                    try:
+                        scope.locator(S.SEL_YIDUN_REFRESH).first.click(
+                            timeout=SLIDER_REFRESH_TIMEOUT
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        _emit(
+                            account_id,
+                            f"[滑块] 刷新按钮不可点击，等验证码自行重绘：{_brief(e)}",
+                            "warn",
+                        )
                     time.sleep(2)
                     break
             except cv2.error as e:
@@ -231,20 +319,77 @@ def solve_slider(page: Page, account_id: Optional[int], max_retry: int = 3) -> N
                     time.sleep(1)
                 continue
             except Exception as e:  # noqa: BLE001
-                _emit(account_id, f"[滑块] 第 {attempt} 次尝试失败：{e}", "warn")
+                # 只取首行：Playwright 超时异常会附带整段 call log，原样输出会刷屏
+                _emit(account_id, f"[滑块] 第 {attempt} 次尝试失败：{_brief(e)}", "warn")
                 continue
 
     _emit(account_id, "[滑块] 多次尝试后仍未通过", "warn")
+    return False
 
 
 # ---------- 二次验证（登录安全验证）----------
+def new_qr_state() -> dict:
+    """跨多次 check_secondary_verification 调用共享的二次验证状态。"""
+    return {"token": None, "pushed": False, "token_pushed": None, "modal_logged": False}
+
+
+def make_scan_response_hook(qr_state: dict):
+    """常驻 response 监听器：scan-apply 接口一出现就把 pollingToken 缓存下来。
+
+    原实现只在单次点击时用 expect_response 抓取，一旦错过那个窗口（接口早于监听
+    到达、超时、或弹窗结构变化导致点击没落在预期元素上），token 就永久丢失，
+    弹窗会一直停在原地不动（issue #22）。常驻监听彻底消除这个竞态。
+    """
+
+    def _hook(resp) -> None:
+        try:
+            if S.SCAN_APPLY_API not in resp.url:
+                return
+            token = ((resp.json() or {}).get("data") or {}).get("pollingToken")
+            if token:
+                qr_state["token"] = token
+        except Exception:  # noqa: BLE001  监听器内异常绝不能影响主流程
+            pass
+
+    return _hook
+
+
+def _push_scan_qr(account_id: Optional[int], token: str, qr_state: Optional[dict] = None) -> bool:
+    """由 pollingToken 生成二维码并推送到 Web 界面 + 通知渠道。"""
+    if not token:
+        return False
+    if qr_state is not None and qr_state.get("token_pushed") == token:
+        return True  # 同一个 token 不重复推送
+    qr_uri = (
+        "orpheus://rnpage?component=rn-account-verify&isTheme=true"
+        "&immersiveMode=true&route=confirmOldDevice"
+        f"&pollingToken={token}"
+    )
+    qr_url = "https://api.pwmqr.com/qrcode/create/?url=" + urllib.parse.quote(qr_uri, safe="")
+    _emit(account_id, f"[二次验证] 扫码链接：{qr_url}", "warn")
+    bus.qrcode(account_id, qr_url, tip="请用网易云音乐 App 扫码确认登录")
+    _notify_qr(account_id, qr_url)
+    if qr_state is not None:
+        qr_state["pushed"] = True
+        qr_state["token_pushed"] = token
+    return True
+
+
 def check_secondary_verification(
-    page: Page, account_id: Optional[int], *, timeout: int = 10, auto_action: bool = True
+    page: Page,
+    account_id: Optional[int],
+    *,
+    timeout: int = 10,
+    auto_action: bool = True,
+    qr_state: Optional[dict] = None,
 ) -> bool:
     """
     检测登录安全验证弹窗。auto_action=True 时优先走「原设备扫码验证」，
     抓 pollingToken 生成二维码链接并推送到 Web + 通知渠道。
     返回 True 表示检测到弹窗（需要用户处理）。
+
+    qr_state 用于跨多次调用记录「二维码是否已推送」与「弹窗是否已播报」，
+    使等待循环可以重试抓取二维码，同时避免每轮轮询都重复打印同一条日志。
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -254,7 +399,16 @@ def check_secondary_verification(
                 if modal.count() == 0:
                     continue
 
-                _emit(account_id, "[二次验证] 检测到登录安全验证弹窗", "warn")
+                # 只在状态跳变时播报，避免 3 秒一条刷屏（issue #22 的日志表现）
+                if qr_state is None or not qr_state.get("modal_logged"):
+                    _emit(account_id, "[二次验证] 检测到登录安全验证弹窗", "warn")
+                    if qr_state is not None:
+                        qr_state["modal_logged"] = True
+
+                # 常驻监听器可能已经抓到 token，先兑现掉
+                if qr_state is not None and qr_state.get("token") and not qr_state.get("pushed"):
+                    _push_scan_qr(account_id, qr_state["token"], qr_state)
+
                 if not auto_action:
                     return True
 
@@ -271,28 +425,25 @@ def check_secondary_verification(
                         txt = opt.locator(S.SEL_SECONDARY_OPTION_TEXT).first.inner_text(timeout=1000)
                         if "原设备扫码验证" in txt:
                             _emit(account_id, "[二次验证] 选择「原设备扫码验证」，抓取 pollingToken")
+                            token = None
                             try:
                                 with page.expect_response(
                                     lambda r: S.SCAN_APPLY_API in r.url, timeout=15000
                                 ) as resp_info:
                                     opt.click()
                                 payload = resp_info.value.json()
-                                token = (payload or {}).get("data", {}).get("pollingToken")
-                                if token:
-                                    qr_uri = (
-                                        "orpheus://rnpage?component=rn-account-verify&isTheme=true"
-                                        "&immersiveMode=true&route=confirmOldDevice"
-                                        f"&pollingToken={token}"
-                                    )
-                                    qr_url = "https://api.pwmqr.com/qrcode/create/?url=" + urllib.parse.quote(qr_uri, safe="")
-                                    _emit(account_id, f"[二次验证] 扫码链接：{qr_url}", "warn")
-                                    bus.qrcode(account_id, qr_url, tip="请用网易云音乐 App 扫码确认登录")
-                                    _notify_qr(account_id, qr_url)
-                                else:
+                                token = ((payload or {}).get("data") or {}).get("pollingToken")
+                                if not token:
                                     _emit(account_id, f"[二次验证] 未提取到 pollingToken：{payload}", "warn")
                             except Exception as e:  # noqa: BLE001
                                 _emit(account_id, f"[二次验证] 监听扫码接口失败：{e}", "warn")
-                                opt.click()
+                            # 兜底：常驻监听器可能已经抓到 token
+                            if not token and qr_state is not None:
+                                token = qr_state.get("token")
+                            if token:
+                                _push_scan_qr(account_id, token, qr_state)
+                            else:
+                                _emit(account_id, "[二次验证] 本轮未获得二维码，稍后自动重试", "warn")
                             return True
                     except Exception:
                         continue
@@ -321,20 +472,112 @@ def check_secondary_verification(
     return False
 
 
-def _notify_qr(account_id: Optional[int], qr_url: str) -> None:
+def _notify_qr(account_id: Optional[int], qr_url: str, *, message: Optional[str] = None) -> None:
     """扫码二维码走通知渠道（企业微信/自定义 webhook）。"""
     try:
         from app.notify import send_configured_notification
 
         identity = account_label(account_id)
         send_configured_notification(
-            f"账号 {identity} 触发登录扫码验证，请尽快扫码：\n{qr_url}",
+            message or f"账号 {identity} 触发登录扫码验证，请尽快扫码：\n{qr_url}",
             title="网易音乐人登录扫码验证",
             event="login_qr",
             extra={"account": identity, "qr_url": qr_url},
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[二次验证] 扫码通知发送失败：{e}")
+
+
+# ---------- 扫码登录 ----------
+def _open_login_page(page: Page) -> None:
+    """打开（或强制重新打开）登录页。
+
+    LOGIN_URL 是 hash 路由（`music.163.com/#/login?...`）。当页面已经停在同一个
+    URL 上时，`page.goto()` 只是改 hash，不会重新加载文档 —— 登录视图会停在上次
+    的密码表单或安全验证弹窗上，二维码 canvas 永远不会出现。所以这里必须显式
+    reload，否则「重新加载登录页」是个空操作。
+    """
+    if page.url.split("#")[0] == S.LOGIN_URL.split("#")[0]:
+        page.reload(wait_until="domcontentloaded")
+    else:
+        page.goto(S.LOGIN_URL, wait_until="domcontentloaded")
+
+
+def _grab_qr_data_uri(page: Page) -> Optional[str]:
+    """把登录页里的二维码导出成 data URI（二维码画布在子 iframe 内）。"""
+    for scope in scopes(page):
+        try:
+            uri = scope.evaluate(S.QR_EXTRACT_SCRIPT)
+        except Exception:  # noqa: BLE001  frame 可能正在导航
+            continue
+        if uri:
+            return uri
+    return None
+
+
+def login_with_qrcode(
+    page: Page,
+    account_id: Optional[int],
+    phone: str,
+    *,
+    timeout: int = QRCODE_LOGIN_TIMEOUT,
+) -> bool:
+    """扫码登录。返回 True 表示服务端已确认登录成功。
+
+    网易云 web 登录页的默认视图就是扫码登录，且全程不触发易盾滑块。二维码由页面
+    自行渲染在子 iframe 的 <canvas> 上，这里用 canvas.toDataURL() 导出成 data URI
+    直接交给前端 <img> 显示。因此这条路径既不需要打码/轨迹模拟，也不需要新增
+    二维码依赖或第三方二维码服务。
+    """
+    _emit(account_id, "[扫码登录] 打开登录页，等待二维码生成")
+    _open_login_page(page)
+
+    deadline = time.time() + timeout
+    last_src: Optional[str] = None
+    misses = 0
+    reloads = 0
+    while time.time() < deadline:
+        _ensure_no_network_risk(page, account_id, "扫码登录期间")
+
+        # 服务端确认登录态优先于一切
+        cookies = page.context.cookies("https://music.163.com")
+        if has_login_cookie(cookies):
+            uid, nickname, _error = fetch_session_user(page, S.MUSICIAN_HOME_URL)
+            if uid:
+                _emit(account_id, f"[扫码登录] 扫码成功：uid={uid}，昵称={nickname or '-'}")
+                return True
+
+        src = _grab_qr_data_uri(page)
+        if src:
+            misses = 0
+            if src != last_src:
+                last_src = src
+                # data URI 直接推给前端 <img>，不经任何第三方服务
+                bus.qrcode(account_id, src, tip="请用网易云音乐 App 扫码登录")
+                _notify_qr(
+                    account_id,
+                    "",
+                    message=(
+                        f"账号 {account_label(account_id, phone=phone)} 需要扫码登录，"
+                        "请打开管理页面用网易云音乐 App 扫码"
+                    ),
+                )
+                _emit(account_id, "[扫码登录] 二维码已推送到网页，请用网易云音乐 App 扫码", "warn")
+        else:
+            misses += 1
+            # 二维码过期或页面被跳转：重新加载登录页再取一次
+            if misses >= 5 and reloads < QRCODE_MAX_RELOAD:
+                reloads += 1
+                misses = 0
+                last_src = None
+                _emit(account_id, f"[扫码登录] 未取到二维码，重新加载登录页（第 {reloads} 次）", "warn")
+                _open_login_page(page)
+
+        time.sleep(2)
+
+    _emit(account_id, f"[扫码登录] {timeout} 秒内未完成扫码", "warn")
+    _debug_shot(page, phone, "qrcode_timeout", account_id)
+    return False
 
 
 # ---------- 登录表单填写 ----------
@@ -383,6 +626,10 @@ def login_account(profile_dir: str, phone: str, password: str, account_id: Optio
     _emit(account_id, f"使用 Playwright 打开登录页，账号：{account_label(account_id, phone=phone)}")
 
     with run_with_context(profile_dir, account_id=account_id, label="登录") as (context, page):
+        # 全程监听扫码验证接口，避免只在单次点击窗口内抓 token（issue #22）
+        qr_state = new_qr_state()
+        page.on("response", make_scan_response_hook(qr_state))
+
         # 先看持久化 profile 是否已是登录态
         try:
             existing = context.cookies("https://music.163.com")
@@ -398,29 +645,48 @@ def login_account(profile_dir: str, phone: str, password: str, account_id: Optio
         except Exception:
             pass
 
-        page.goto(S.LOGIN_URL, wait_until="domcontentloaded")
-        _emit(account_id, "开始执行自动登录流程")
+        # 登录方式：auto（密码优先，失败自动转扫码）/ password / qrcode
+        method = (repo.get_setting("login_method", LOGIN_METHOD) or LOGIN_METHOD).strip().lower()
+        if method not in LOGIN_METHODS:
+            method = "auto"
+        use_qr = method == "qrcode"
+        # use_qr 会被后续降级逻辑改写，这里单独记下「本次是否真的走过密码登录」，
+        # 用于判断要不要检查二次验证弹窗（见下方二次验证段的注释）。
+        attempted_password = not use_qr
+        fallback_reason = ""
+        if use_qr:
+            _emit(account_id, "登录方式为「扫码登录」，跳过密码登录")
 
-        try:
-            do_login_with_phone(page, phone, password, account_id)
-        except Exception as e:  # noqa: BLE001
-            _emit(account_id, f"登录表单填写异常：{e}", "error")
-            _debug_shot(page, phone, "login_flow_error", account_id)
-            raise
+        if not use_qr:
+            _open_login_page(page)
+            _emit(account_id, "开始执行自动登录流程")
+
+            try:
+                do_login_with_phone(page, phone, password, account_id)
+            except Exception as e:  # noqa: BLE001
+                _emit(account_id, f"登录表单填写异常：{e}", "error")
+                _debug_shot(page, phone, "login_flow_error", account_id)
+                if method != "auto":
+                    raise
+                fallback_reason = f"登录表单填写异常：{e}"
+                use_qr = True
 
         # 滑块
-        try:
-            solve_slider(page, account_id)
-        except NetworkRiskError:
-            _debug_shot(page, phone, "network_risk_slider", account_id)
-            bus.status(account_id, "login_fail", "网络环境风险")
-            return {"ok": False, "cookie_str": "", "message": "network risk"}
-        except Exception as e:  # noqa: BLE001
-            _emit(account_id, f"滑块处理异常：{e}", "warn")
-            _debug_shot(page, phone, "slider_exception", account_id)
+        if not use_qr:
+            try:
+                if not solve_slider(page, account_id) and method == "auto":
+                    fallback_reason = "滑块验证多次未通过"
+                    use_qr = True
+            except NetworkRiskError:
+                _debug_shot(page, phone, "network_risk_slider", account_id)
+                bus.status(account_id, "login_fail", "网络环境风险")
+                return {"ok": False, "cookie_str": "", "message": "network risk"}
+            except Exception as e:  # noqa: BLE001
+                _emit(account_id, f"滑块处理异常：{e}", "warn")
+                _debug_shot(page, phone, "slider_exception", account_id)
 
         # 滑块成功后可能回到「密码登录」选项卡，重试最多 3 次
-        for _ in range(3):
+        for _ in range(0 if use_qr else 3):
             time.sleep(1)
             if not try_click_if_visible(page, "密码登录", exact_text=True, timeout_ms=2500):
                 break
@@ -447,35 +713,99 @@ def login_account(profile_dir: str, phone: str, password: str, account_id: Optio
             bus.status(account_id, "login_fail", "网络环境风险")
             return {"ok": False, "cookie_str": "", "message": "network risk"}
 
-        # 二次验证
+        # 二次验证。
+        # 这里必须用 attempted_password 而不是 not use_qr：滑块判定失败有可能是假阴性
+        # （服务端其实已放行并弹出了「登录安全验证」），若因 use_qr=True 而跳过本段，
+        # 弹窗就完全不会被处理，页面卡在弹窗上，扫码降级也因页面没变而拿不到二维码。
         try:
-            if check_secondary_verification(page, account_id, timeout=10):
+            if attempted_password and check_secondary_verification(
+                page, account_id, timeout=10, qr_state=qr_state
+            ):
+                if use_qr:
+                    # 弹窗存在 = 密码登录已被服务端受理，撤销滑块失败触发的扫码降级
+                    _emit(
+                        account_id,
+                        f"[登录] 已进入登录安全验证，取消扫码降级（{fallback_reason or '滑块判定失败'}）",
+                        "warn",
+                    )
+                    use_qr = False
+                    fallback_reason = ""
                 _emit(account_id, "[登录] 需要二次验证，等待完成...", "warn")
                 bus.status(account_id, "secondary", "等待二次验证/扫码")
-                deadline = time.time() + 180
+                deadline = time.time() + SECONDARY_WAIT_SECONDS
+                last_retry = time.time()
                 while time.time() < deadline:
-                    if not check_secondary_verification(page, account_id, timeout=2, auto_action=False):
+                    # 常驻监听器随时可能抓到 token，一有就立刻兑现成二维码
+                    if not qr_state["pushed"] and qr_state["token"]:
+                        _push_scan_qr(account_id, qr_state["token"], qr_state)
+                    if not check_secondary_verification(
+                        page, account_id, timeout=2, auto_action=False, qr_state=qr_state
+                    ):
                         _emit(account_id, "[登录] 二次验证已完成")
                         break
+                    # 二维码始终没拿到时定期重新尝试抓取，而不是干等到超时（issue #22）
+                    if not qr_state["pushed"] and time.time() - last_retry >= QR_RETRY_INTERVAL:
+                        last_retry = time.time()
+                        _emit(account_id, "[二次验证] 仍未获得二维码，重试抓取", "warn")
+                        check_secondary_verification(
+                            page, account_id, timeout=3, auto_action=True, qr_state=qr_state
+                        )
                     time.sleep(3)
                 else:
                     _emit(account_id, "[登录] 二次验证等待超时", "warn")
+                if not qr_state["pushed"]:
+                    _emit(
+                        account_id,
+                        "[二次验证] 始终未能获取扫码二维码，请在浏览器弹窗中手动选择验证方式，"
+                        "或把设置里的登录方式改为「扫码登录」",
+                        "error",
+                    )
+                    _debug_shot(page, phone, "secondary_no_qr", account_id)
+                    bus.status(account_id, "secondary", "二维码获取失败")
+                    if method == "auto":
+                        fallback_reason = "二次验证未能获取二维码"
+                        use_qr = True
         except Exception as e:  # noqa: BLE001
             _emit(account_id, f"检查二次验证出错：{e}", "warn")
 
-        # 等待服务端确认登录成功。旧 cookie 可能仍存在，不能只检查 cookie 名称。
-        cookie_str, ok = "", False
-        uid, nickname = None, None
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            cookies = context.cookies("https://music.163.com")
-            cookie_str = cookies_to_str(cookies)
-            if has_login_cookie(cookies):
-                uid, nickname, _error = fetch_session_user(page, S.MUSICIAN_HOME_URL)
-                if uid:
-                    ok = True
-                    break
-            time.sleep(1)
+        def _confirm_session() -> tuple[bool, str, Optional[str], Optional[str]]:
+            """等待服务端确认登录成功。旧 cookie 可能仍存在，不能只检查 cookie 名称。"""
+            cookie_str, ok = "", False
+            uid, nickname = None, None
+            deadline = time.time() + CONFIRM_WAIT_SECONDS
+            while time.time() < deadline:
+                cookies = context.cookies("https://music.163.com")
+                cookie_str = cookies_to_str(cookies)
+                if has_login_cookie(cookies):
+                    uid, nickname, _error = fetch_session_user(page, S.MUSICIAN_HOME_URL)
+                    if uid:
+                        ok = True
+                        break
+                time.sleep(1)
+            return ok, cookie_str, uid, nickname
+
+        def _try_qrcode_login() -> tuple[bool, str, Optional[str], Optional[str]]:
+            bus.status(account_id, "secondary", "等待扫码登录")
+            try:
+                if login_with_qrcode(page, account_id, phone):
+                    return _confirm_session()
+            except NetworkRiskError:
+                _debug_shot(page, phone, "network_risk_qrcode", account_id)
+                _emit(account_id, "[扫码登录] 页面提示网络环境风险", "error")
+            except Exception as exc:  # noqa: BLE001
+                _emit(account_id, f"[扫码登录] 异常：{exc}", "warn")
+            return False, cookies_to_str(context.cookies("https://music.163.com")), None, None
+
+        if use_qr:
+            if fallback_reason:
+                _emit(account_id, f"[登录] 密码登录未成功（{fallback_reason}），自动切换扫码登录", "warn")
+            ok, cookie_str, uid, nickname = _try_qrcode_login()
+        else:
+            ok, cookie_str, uid, nickname = _confirm_session()
+            # auto 模式下密码登录最终没拿到有效会话，再给一次扫码机会
+            if not ok and method == "auto":
+                _emit(account_id, "[登录] 密码登录未通过服务端校验，自动切换扫码登录", "warn")
+                ok, cookie_str, uid, nickname = _try_qrcode_login()
 
         if ok:
             _emit(account_id, f"已获取账号信息：uid={uid}，昵称={nickname or '-'}")
