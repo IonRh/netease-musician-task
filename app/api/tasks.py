@@ -12,7 +12,7 @@ from app.logging_conf import logger
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
-_VALID_TASKS = {"checkin", "publish", "vip"}
+_VALID_TASKS = {"checkin", "publish", "vip", "listen"}
 _TASK_ALIASES = {"publishing": "publish"}  # 兼容修复前的网页缓存
 
 

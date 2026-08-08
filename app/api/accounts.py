@@ -16,7 +16,8 @@ router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 
 class AccountCreate(BaseModel):
     phone: str
-    password: str
+    password: str = ""
+    login_method: str | None = None
     run_time: str | None = None
     interval_days: int | None = None
     enabled: bool = True
@@ -24,6 +25,7 @@ class AccountCreate(BaseModel):
 
 class AccountUpdate(BaseModel):
     password: str | None = None
+    login_method: str | None = None
     run_time: str | None = None
     interval_days: int | None = None
     enabled: bool | None = None
@@ -56,6 +58,7 @@ def create_account(body: AccountCreate) -> dict:
     account_id = repo.create_account(
         body.phone,
         body.password,
+        login_method=body.login_method,
         run_time=body.run_time,
         interval_days=body.interval_days,
         enabled=body.enabled,

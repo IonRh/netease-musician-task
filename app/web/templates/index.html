@@ -48,6 +48,32 @@
       </div>
     </main>
 
+    <!-- 听歌配置弹窗 -->
+    <div id="modal-listen-join" class="modal hidden">
+      <div class="modal-card listen-modal-card">
+        <div class="modal-head">
+          <h3>听歌配置</h3>
+          <button class="x" data-close>&times;</button>
+        </div>
+        <input id="listen-account-id" type="hidden" />
+        <p class="confirm-text">账号：<b id="listen-phone"></b></p>
+        <div class="listen-status-grid">
+          <div>加入状态：<span id="listen-status" class="badge unknown">未加入</span></div>
+          <div>今日听歌任务：<b id="listen-today-progress">-</b></div>
+          <div>当月听歌任务：<b id="listen-month-progress">-</b></div>
+          <div>当日被听歌任务：<b id="listen-today-received-progress">-</b></div>
+          <div>当月被听歌任务：<b id="listen-month-received-progress">-</b></div>
+        </div>
+        <p id="listen-error" class="error-text"></p>
+        <p class="hint-text">听歌地址和歌曲配置请在“全局设置”中修改。</p>
+        <div class="modal-actions">
+          <button class="btn" data-close>取消</button>
+          <button class="btn btn-danger" id="btn-leave-listen">退出听歌</button>
+          <button class="btn btn-primary" id="btn-join-listen">加入听歌</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 新增账号弹窗 -->
     <div id="modal-add" class="modal hidden">
       <div class="modal-card">
@@ -59,8 +85,16 @@
           >手机号 <input id="in-phone" type="text" placeholder="手机号"
         /></label>
         <label
-          >密码 <input id="in-password" type="password" placeholder="密码"
+          >密码 <input id="in-password" type="password" placeholder="自动/密码登录必填"
         /></label>
+        <label
+          >登录方式
+          <select id="in-login-method">
+            <option value="auto">自动（密码优先，失败转扫码）</option>
+            <option value="password">仅密码登录</option>
+            <option value="qrcode">仅扫码登录（不触发滑块）</option>
+          </select>
+        </label>
         <label>运行时间 <input id="in-runtime" type="time" /></label>
         <div class="modal-actions">
           <button class="btn" data-close>取消</button>
@@ -98,58 +132,99 @@
 
     <!-- 全局设置弹窗 -->
     <div id="modal-settings" class="modal hidden">
-      <div class="modal-card">
+      <div class="modal-card modal-settings-card">
         <div class="modal-head">
           <h3>全局设置</h3>
           <button class="x" data-close>&times;</button>
         </div>
-        <label>默认运行时间 <input id="set-send-time" type="time" /></label>
-        <label>执行间隔天数 <input id="set-interval" type="number" /></label>
-        <label>每月最大发布 <input id="set-max-sends" type="number" /></label>
-        <label class="row"
-          ><input id="set-headless" type="checkbox" /> 无头模式（服务器）</label
-        >
-        <label
-          >登录方式
-          <select id="set-login-method">
-            <option value="auto">自动（密码优先，失败转扫码）</option>
-            <option value="password">仅密码登录</option>
-            <option value="qrcode">仅扫码登录（不触发滑块）</option>
-          </select>
-        </label>
-        <div class="section-title">修改管理密码</div>
-        <label>当前管理密码 <input id="set-current-admin-password" type="password" autocomplete="current-password" /></label>
-        <label>新管理密码 <input id="set-new-admin-password" type="password" autocomplete="new-password" placeholder="留空则不修改" /></label>
-        <label>确认新管理密码 <input id="set-confirm-admin-password" type="password" autocomplete="new-password" /></label>
-        <label>企业微信 Key <input id="set-wecom" type="text" /></label>
-        <div class="section-title">自定义 Webhook（优先于企业微信）</div>
-        <label
-          >Webhook URL
-          <input id="set-webhook-url" type="text" placeholder="留空则不启用"
-        /></label>
-        <label
-          >请求方法
-          <select id="set-webhook-method">
-            <option value="POST">POST</option>
-            <option value="GET">GET</option>
-            <option value="PUT">PUT</option>
-          </select>
-        </label>
-        <label
-          >请求头
-          <input
-            id="set-webhook-headers"
-            type="text"
-            placeholder='JSON 或 "K: V; K2: V2"'
-        /></label>
-        <label
-          >Body 模板
-          <textarea
-            id="set-webhook-body"
-            rows="3"
-            placeholder="留空用默认 JSON；支持 ${title} ${content} 占位符"
-          ></textarea>
-        </label>
+        <div class="settings-grid">
+          <div class="settings-column">
+            <div class="section-title">任务与登录</div>
+            <div class="settings-compact-grid">
+              <label>默认运行时间 <input id="set-send-time" type="time" /></label>
+              <label>执行间隔天数 <input id="set-interval" type="number" /></label>
+              <label>每月最大发布 <input id="set-max-sends" type="number" /></label>
+            </div>
+            <label class="row"
+              ><input id="set-headless" type="checkbox" /> 无头模式（服务器）</label
+            >
+            <div class="section-title">听歌任务</div>
+            <div class="settings-compact-grid">
+              <label>当天最多听 <input id="set-listen-daily-max" type="number" min="0" /></label>
+              <label>当月最多听 <input id="set-listen-monthly-max" type="number" min="0" /></label>
+              <label>默认听歌开始时间 <input id="set-listen-start-time" type="time" /></label>
+            </div>
+            <div class="listen-config-row">
+              <label>听歌 API 地址 <input id="set-listen-api-url" type="url" placeholder="例如 http://127.0.0.1:9000" /></label>
+              <label>歌曲/专辑
+                <div class="listen-item-input">
+                  <select id="set-listen-item-type">
+                    <option value="song">歌曲</option>
+                    <option value="album">专辑</option>
+                  </select>
+                  <input id="set-listen-item-id" type="text" placeholder="ID" />
+                </div>
+              </label>
+            </div>
+            <div class="section-title">修改管理密码</div>
+            <div class="settings-password-grid">
+              <label>当前管理密码 <input id="set-current-admin-password" type="password" autocomplete="current-password" /></label>
+              <label>新管理密码 <input id="set-new-admin-password" type="password" autocomplete="new-password" placeholder="留空则不修改" /></label>
+              <label>确认新管理密码 <input id="set-confirm-admin-password" type="password" autocomplete="new-password" /></label>
+            </div>
+          </div>
+
+          <div class="settings-column">
+            <div class="section-title">推送方式</div>
+            <label
+              >选择推送方式
+              <select id="set-notification-method">
+                <option value="none">不推送</option>
+                <option value="auto">自动（兼容旧配置）</option>
+                <option value="wecom">企业微信</option>
+                <option value="pushplus">PushPlus</option>
+                <option value="custom">自定义 Webhook</option>
+              </select>
+            </label>
+            <div id="notify-wecom-fields">
+              <label class="section-title">企业微信 Key <input id="set-wecom" type="text" placeholder="留空则不启用" /></label>
+            </div>
+            <div id="notify-pushplus-fields">
+              <label class="section-title">PushPlus Token <input id="set-pushplus-token" type="password" autocomplete="off" placeholder="留空则不启用" /></label>
+              <label>Topic（可选）<input id="set-pushplus-topic" type="text" placeholder="留空则只推送给自己" /></label>
+            </div>
+            <div id="notify-custom-fields">
+              <div class="section-title">自定义 Webhook</div>
+              <label
+                >Webhook URL
+                <input id="set-webhook-url" type="text" placeholder="留空则不启用"
+              /></label>
+              <label
+                >请求方法
+                <select id="set-webhook-method">
+                  <option value="POST">POST</option>
+                  <option value="GET">GET</option>
+                  <option value="PUT">PUT</option>
+                </select>
+              </label>
+              <label
+                >请求头
+                <input
+                  id="set-webhook-headers"
+                  type="text"
+                  placeholder='JSON 或 "K: V; K2: V2"'
+              /></label>
+              <label
+                >Body 模板
+                <textarea
+                  id="set-webhook-body"
+                  rows="3"
+                  placeholder="留空用默认 JSON；支持 ${title} ${content} 占位符"
+                ></textarea>
+              </label>
+            </div>
+          </div>
+        </div>
         <div class="modal-actions">
           <button class="btn" data-close>取消</button>
           <button class="btn btn-primary" id="btn-save-settings">保存</button>
@@ -200,6 +275,9 @@
         <label class="row"
           ><input type="checkbox" class="run-task" value="vip" /> 领取 VIP
           权益</label
+        >
+        <label class="row"
+          ><input type="checkbox" class="run-task" value="listen" /> 听歌</label
         >
         <p class="hint-text">
           提示：发布动态与领取 VIP 同时勾选时，本次优先执行 VIP。

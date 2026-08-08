@@ -13,6 +13,11 @@ _EDITABLE = {
     "default_send_time",
     "execution_interval_days",
     "max_monthly_sends",
+    "listen_api_url",
+    "listen_item_id",
+    "listen_daily_max",
+    "listen_monthly_max",
+    "listen_start_time",
     "headless",
     "login_method",
     "wecom_webhook_key",
@@ -20,6 +25,9 @@ _EDITABLE = {
     "custom_webhook_method",
     "custom_webhook_headers",
     "custom_webhook_body",
+    "notification_method",
+    "pushplus_token",
+    "pushplus_topic",
 }
 
 

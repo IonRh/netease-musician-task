@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     nickname            TEXT,
     profile_dir         TEXT,
     enabled             INTEGER NOT NULL DEFAULT 1,
+    login_method        TEXT,          -- auto / password / qrcode
     run_time            TEXT,          -- HH:MM，空则用全局
     interval_days       INTEGER,       -- 空则用全局
     cookie_status       TEXT DEFAULT 'unknown',   -- ok / expired / unknown
@@ -24,6 +25,13 @@ CREATE TABLE IF NOT EXISTS accounts (
     last_send_date      TEXT,          -- YYYY-MM-DD
     monthly_sends       INTEGER NOT NULL DEFAULT 0,
     month_tag           TEXT,          -- YYYY-MM，用于月度计数归零
+    listen_api_url      TEXT,
+    listen_item_id      TEXT,
+    listen_status       TEXT DEFAULT 'unconfigured',
+    listen_error        TEXT,
+    listen_play_count   INTEGER NOT NULL DEFAULT 0,
+    listen_received_count INTEGER NOT NULL DEFAULT 0,
+    listen_last_at      TEXT,
     created_at          TEXT DEFAULT (datetime('now','localtime')),
     updated_at          TEXT DEFAULT (datetime('now','localtime'))
 );
@@ -68,6 +76,21 @@ def init_db() -> None:
     """建表并播种全局 settings（仅首次）。"""
     with db() as conn:
         conn.executescript(SCHEMA)
+        account_columns = {row["name"] for row in conn.execute("PRAGMA table_info(accounts)")}
+        if "login_method" not in account_columns:
+            conn.execute("ALTER TABLE accounts ADD COLUMN login_method TEXT")
+        listen_columns = {
+            "listen_api_url": "TEXT",
+            "listen_item_id": "TEXT",
+            "listen_status": "TEXT DEFAULT 'unconfigured'",
+            "listen_error": "TEXT",
+            "listen_play_count": "INTEGER NOT NULL DEFAULT 0",
+            "listen_received_count": "INTEGER NOT NULL DEFAULT 0",
+            "listen_last_at": "TEXT",
+        }
+        for name, definition in listen_columns.items():
+            if name not in account_columns:
+                conn.execute(f"ALTER TABLE accounts ADD COLUMN {name} {definition}")
         for k, v in SETTINGS_SEED.items():
             conn.execute(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v)

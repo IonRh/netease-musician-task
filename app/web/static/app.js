@@ -145,6 +145,7 @@ async function loadAccounts() {
       <td data-label="本月发布">${a.monthly_sends || 0}</td>
       <td data-label="操作" class="cell-actions">
         <button class="btn btn-sm btn-primary" data-act="login" data-id="${a.id}" data-phone="${escapeHtml(a.phone)}">登录</button>
+        <button class="btn btn-sm" data-act="listen-join" data-id="${a.id}" data-phone="${escapeHtml(a.phone)}">听歌配置</button>
         ${actionBtn}
         ${toggleBtn}
         <button class="btn btn-sm" data-act="edit" data-id="${a.id}">编辑</button>
@@ -181,6 +182,8 @@ $("#acc-body").addEventListener("click", async (e) => {
   try {
     if (act === "login") {
       openLoginConfirm(id, btn.dataset.phone);
+    } else if (act === "listen-join") {
+      openListenJoin(id, btn.dataset.phone);
     } else if (act === "run") {
       openRunSelect(id, btn.dataset.phone);
     } else if (act === "toggle") {
@@ -200,6 +203,85 @@ $("#acc-body").addEventListener("click", async (e) => {
   } catch (err) {
     appendLog("", "操作失败：" + err.message, "error");
     alert("操作失败：" + err.message);
+  }
+});
+
+// ---------- 听歌概览 ----------
+async function openListenJoin(id, phone) {
+  $("#listen-account-id").value = id;
+  $("#listen-phone").textContent = phone || `#${id}`;
+  $("#listen-status").textContent = "读取中...";
+  $("#listen-status").className = "badge";
+  $("#listen-today-progress").textContent = "-";
+  $("#listen-month-progress").textContent = "-";
+  $("#listen-today-received-progress").textContent = "-";
+  $("#listen-month-received-progress").textContent = "-";
+  $("#listen-error").textContent = "";
+  $("#modal-listen-join").classList.remove("hidden");
+  try {
+    const data = await api(`/api/listen/status/${id}`);
+    const listen = data.listen || {};
+    const progress = data.progress || {};
+    const normal = listen.status === "normal";
+    $("#listen-status").textContent = normal ? "正常" : (listen.status === "error" ? "异常" : "未加入");
+    $("#listen-status").className = `badge ${normal ? "ok" : (listen.status === "error" ? "expired" : "unknown")}`;
+    const progressText = (count, limit) => `${count ?? 0}/${limit > 0 ? limit : "不限"}`;
+    $("#listen-today-progress").textContent = progressText(
+      progress.today_listen_count,
+      progress.daily_listen_limit,
+    );
+    $("#listen-month-progress").textContent = progressText(
+      progress.monthly_listen_count,
+      progress.monthly_listen_limit,
+    );
+    $("#listen-today-received-progress").textContent = progressText(
+      progress.today_listened_count,
+      progress.daily_listen_limit,
+    );
+    $("#listen-month-received-progress").textContent = progressText(
+      progress.monthly_listened_count,
+      progress.monthly_listen_limit,
+    );
+    $("#listen-error").textContent = listen.error || "";
+  } catch (err) {
+    $("#listen-status").textContent = "异常";
+    $("#listen-status").className = "badge expired";
+    $("#listen-error").textContent = err.message;
+  }
+}
+
+$("#btn-join-listen").addEventListener("click", async () => {
+  const account_id = Number($("#listen-account-id").value);
+  const settings = await api("/api/settings");
+  const api_url = settings.listen_api_url?.trim() || "";
+  const raw_item_id = settings.listen_item_id?.trim() || "";
+  if (!api_url || !raw_item_id) {
+    alert("请先在全局设置中填写听歌 API 地址和歌曲/专辑 ID");
+    return;
+  }
+  try {
+    await api("/api/listen/join", {
+      method: "POST",
+      body: JSON.stringify({ account_id, api_url, netease_item_id: raw_item_id }),
+    });
+    $("#modal-listen-join").classList.add("hidden");
+    await loadAccounts();
+    alert("已加入听歌");
+  } catch (err) {
+    alert("加入听歌失败：" + err.message);
+  }
+});
+
+$("#btn-leave-listen").addEventListener("click", async () => {
+  const account_id = Number($("#listen-account-id").value);
+  if (!confirm("确定退出当前账号的听歌互助吗？")) return;
+  try {
+    await api(`/api/listen/leave/${account_id}`, { method: "DELETE" });
+    $("#modal-listen-join").classList.add("hidden");
+    await loadAccounts();
+    alert("已退出听歌");
+  } catch (err) {
+    alert("退出听歌失败：" + err.message);
   }
 });
 
@@ -286,24 +368,42 @@ document
   );
 
 // ---------- 新增账号 ----------
+function refreshAddLoginFields() {
+  const method = $("#in-login-method").value;
+  const passwordLabel = $("#in-password").closest("label");
+  const passwordInput = $("#in-password");
+  const qrOnly = method === "qrcode";
+  passwordLabel.firstChild.textContent = qrOnly ? "密码（可选） " : "密码 ";
+  passwordInput.placeholder = qrOnly ? "扫码登录无需填写" : "自动/密码登录必填";
+}
+
+$("#in-login-method").addEventListener("change", refreshAddLoginFields);
+
 $("#btn-add").addEventListener("click", () => {
   $("#in-phone").value = "";
   $("#in-password").value = "";
+  $("#in-login-method").value = "auto";
   $("#in-runtime").value = globalSendTime || "";
+  refreshAddLoginFields();
   $("#modal-add").classList.remove("hidden");
 });
 $("#btn-save-add").addEventListener("click", async () => {
   const phone = $("#in-phone").value.trim();
   const password = $("#in-password").value;
+  const login_method = $("#in-login-method").value;
   const run_time = $("#in-runtime").value.trim() || null;
-  if (!phone || !password) {
-    alert("请填写手机号和密码");
+  if (!phone) {
+    alert("请填写手机号");
+    return;
+  }
+  if (login_method !== "qrcode" && !password) {
+    alert("当前登录方式需要填写密码");
     return;
   }
   try {
     const acc = await api("/api/accounts", {
       method: "POST",
-      body: JSON.stringify({ phone, password, run_time }),
+      body: JSON.stringify({ phone, password, login_method, run_time }),
     });
     $("#modal-add").classList.add("hidden");
     openRunModal(`账号 ${phone} 登录中`, acc.id);
@@ -348,18 +448,42 @@ $("#btn-save-edit").addEventListener("click", async () => {
 });
 
 // ---------- 全局设置 ----------
+function refreshNotificationFields() {
+  const method = $("#set-notification-method").value;
+  $("#notify-wecom-fields").classList.toggle("hidden", method !== "wecom" && method !== "auto");
+  $("#notify-custom-fields").classList.toggle("hidden", method !== "custom" && method !== "auto");
+  $("#notify-pushplus-fields").classList.toggle("hidden", method !== "pushplus" && method !== "auto");
+}
+
+$("#set-notification-method").addEventListener("change", refreshNotificationFields);
+
 $("#btn-settings").addEventListener("click", async () => {
   const s = await api("/api/settings");
   $("#set-send-time").value = s.default_send_time || "";
   $("#set-interval").value = s.execution_interval_days || "";
   $("#set-max-sends").value = s.max_monthly_sends || "";
   $("#set-headless").checked = s.headless === "1";
-  $("#set-login-method").value = s.login_method || "auto";
+  $("#set-listen-daily-max").value = s.listen_daily_max || "1";
+  $("#set-listen-monthly-max").value = s.listen_monthly_max || "30";
+  $("#set-listen-start-time").value = s.listen_start_time || s.default_send_time || "09:30";
+  $("#set-listen-api-url").value = s.listen_api_url || "";
+  const listenItem = s.listen_item_id || "";
+  if (listenItem.startsWith("album:")) {
+    $("#set-listen-item-type").value = "album";
+    $("#set-listen-item-id").value = listenItem.slice(6);
+  } else {
+    $("#set-listen-item-type").value = "song";
+    $("#set-listen-item-id").value = listenItem;
+  }
+  $("#set-notification-method").value = s.notification_method || "none";
   $("#set-wecom").value = s.wecom_webhook_key || "";
   $("#set-webhook-url").value = s.custom_webhook_url || "";
   $("#set-webhook-method").value = s.custom_webhook_method || "POST";
   $("#set-webhook-headers").value = s.custom_webhook_headers || "";
   $("#set-webhook-body").value = s.custom_webhook_body || "";
+  $("#set-pushplus-token").value = s.pushplus_token || "";
+  $("#set-pushplus-topic").value = s.pushplus_topic || "";
+  refreshNotificationFields();
   $("#set-current-admin-password").value = "";
   $("#set-new-admin-password").value = "";
   $("#set-confirm-admin-password").value = "";
@@ -371,12 +495,21 @@ $("#btn-save-settings").addEventListener("click", async () => {
     execution_interval_days: $("#set-interval").value.trim(),
     max_monthly_sends: $("#set-max-sends").value.trim(),
     headless: $("#set-headless").checked ? "1" : "0",
-    login_method: $("#set-login-method").value,
+    listen_daily_max: $("#set-listen-daily-max").value.trim() || "0",
+    listen_monthly_max: $("#set-listen-monthly-max").value.trim() || "0",
+    listen_start_time: $("#set-listen-start-time").value.trim() || "09:30",
+    listen_api_url: $("#set-listen-api-url").value.trim(),
+    listen_item_id: $("#set-listen-item-type").value === "album"
+      ? `album:${$("#set-listen-item-id").value.trim()}`
+      : $("#set-listen-item-id").value.trim(),
+    notification_method: $("#set-notification-method").value,
     wecom_webhook_key: $("#set-wecom").value.trim(),
     custom_webhook_url: $("#set-webhook-url").value.trim(),
     custom_webhook_method: $("#set-webhook-method").value,
     custom_webhook_headers: $("#set-webhook-headers").value.trim(),
     custom_webhook_body: $("#set-webhook-body").value.trim(),
+    pushplus_token: $("#set-pushplus-token").value.trim(),
+    pushplus_topic: $("#set-pushplus-topic").value.trim(),
   };
   try {
     const currentPassword = $("#set-current-admin-password").value;
@@ -394,9 +527,13 @@ $("#btn-save-settings").addEventListener("click", async () => {
       method: "PUT",
       body: JSON.stringify({ values }),
     });
+    const syncResult = await api("/api/listen/sync", { method: "POST" });
     $("#modal-settings").classList.add("hidden");
     await refreshGlobalSendTime();
     await loadAccounts();
+    if (syncResult.failed?.length) {
+      alert(`全局配置已保存，但有 ${syncResult.failed.length} 个账号同步失败`);
+    }
   } catch (err) {
     alert("保存失败：" + err.message);
   }

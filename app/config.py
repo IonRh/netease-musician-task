@@ -7,6 +7,11 @@ from __future__ import annotations
 
 import os
 
+from dotenv import load_dotenv
+
+# 从项目根目录加载 .env；真实环境变量仍优先，不会被 .env 覆盖。
+load_dotenv()
+
 # ---- 路径 ----
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.getenv("APP_DATA_DIR", os.path.join(APP_DIR, "data"))
@@ -47,6 +52,8 @@ CUSTOM_WEBHOOK_URL = os.getenv("CUSTOM_WEBHOOK_URL", "")
 CUSTOM_WEBHOOK_METHOD = os.getenv("CUSTOM_WEBHOOK_METHOD", "POST")
 CUSTOM_WEBHOOK_HEADERS = os.getenv("CUSTOM_WEBHOOK_HEADERS", "")
 CUSTOM_WEBHOOK_BODY = os.getenv("CUSTOM_WEBHOOK_BODY", "")
+PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN", "")
+PUSHPLUS_TOPIC = os.getenv("PUSHPLUS_TOPIC", "")
 
 # 登录方式：auto（密码优先，失败自动转扫码）/ password（仅密码）/ qrcode（仅扫码）
 LOGIN_METHODS = ("auto", "password", "qrcode")
@@ -59,6 +66,11 @@ SETTINGS_SEED = {
     "default_send_time": DEFAULT_SEND_TIME,
     "execution_interval_days": str(DEFAULT_INTERVAL_DAYS),
     "max_monthly_sends": str(MAX_MONTHLY_SENDS),
+    "listen_api_url": "",
+    "listen_item_id": "",
+    "listen_daily_max": "1",
+    "listen_monthly_max": "30",
+    "listen_start_time": DEFAULT_SEND_TIME,
     "headless": "1" if HEADLESS else "0",
     "login_method": LOGIN_METHOD,
     "wecom_webhook_key": WECOM_WEBHOOK_KEY,
@@ -66,4 +78,7 @@ SETTINGS_SEED = {
     "custom_webhook_method": CUSTOM_WEBHOOK_METHOD,
     "custom_webhook_headers": CUSTOM_WEBHOOK_HEADERS,
     "custom_webhook_body": CUSTOM_WEBHOOK_BODY,
+    "notification_method": "none",
+    "pushplus_token": PUSHPLUS_TOKEN,
+    "pushplus_topic": PUSHPLUS_TOPIC,
 }

@@ -79,14 +79,15 @@ def create_account(
     *,
     run_time: Optional[str] = None,
     interval_days: Optional[int] = None,
+    login_method: Optional[str] = None,
     enabled: bool = True,
 ) -> int:
     profile_dir = os.path.join(PROFILE_BASEDIR, _safe_phone(phone))
     with db() as conn:
         cur = conn.execute(
-            "INSERT INTO accounts(phone, password, profile_dir, enabled, run_time, interval_days) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (phone, password, profile_dir, 1 if enabled else 0, run_time, interval_days),
+            "INSERT INTO accounts(phone, password, profile_dir, enabled, login_method, run_time, interval_days) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (phone, password, profile_dir, 1 if enabled else 0, login_method, run_time, interval_days),
         )
         return int(cur.lastrowid)
 
@@ -96,8 +97,10 @@ def update_account(account_id: int, **fields) -> None:
         return
     allowed = {
         "phone", "password", "uid", "nickname", "profile_dir", "enabled",
-        "run_time", "interval_days", "cookie_status", "last_login_at",
+        "login_method", "run_time", "interval_days", "cookie_status", "last_login_at",
         "further_vip_get_time", "last_send_date", "monthly_sends", "month_tag",
+        "listen_api_url", "listen_item_id", "listen_status", "listen_error",
+        "listen_play_count", "listen_received_count", "listen_last_at",
     }
     sets, vals = [], []
     for k, v in fields.items():
@@ -126,6 +129,32 @@ def add_log(account_id: Optional[int], task_type: str, status: str, message: str
             "INSERT INTO task_logs(account_id, task_type, status, message) VALUES (?, ?, ?, ?)",
             (account_id, task_type, status, message[:2000]),
         )
+
+def count_success_logs_today(account_id: int, task_type: str) -> int:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM task_logs
+            WHERE account_id=? AND task_type=? AND status='success'
+              AND date(created_at, 'localtime')=date('now', 'localtime')
+            """,
+            (account_id, task_type),
+        ).fetchone()
+        return int(row["total"] or 0)
+
+def count_success_logs_this_month(account_id: int, task_type: str) -> int:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM task_logs
+            WHERE account_id=? AND task_type=? AND status='success'
+              AND strftime('%Y-%m', created_at)=strftime('%Y-%m', 'now', 'localtime')
+            """,
+            (account_id, task_type),
+        ).fetchone()
+        return int(row["total"] or 0)
 
 
 def list_logs(account_id: Optional[int] = None, limit: int = 100) -> list[dict[str, Any]]:

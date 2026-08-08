@@ -10,3 +10,5 @@ test/
 .env
 .vscode
 app/data/
+.env.example
+server_api

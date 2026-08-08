@@ -536,16 +536,22 @@ def login_with_qrcode(
     last_src: Optional[str] = None
     misses = 0
     reloads = 0
+    last_status_log = 0.0
     while time.time() < deadline:
         _ensure_no_network_risk(page, account_id, "扫码登录期间")
 
-        # 服务端确认登录态优先于一切
+        # 服务端确认登录态优先于一切。不能只依赖 MUSIC_U/__csrf：
+        # 网易云扫码成功后可能先更新服务端会话，Cookie 写入会稍晚或使用其他 Cookie。
         cookies = page.context.cookies("https://music.163.com")
-        if has_login_cookie(cookies):
-            uid, nickname, _error = fetch_session_user(page, S.MUSICIAN_HOME_URL)
-            if uid:
-                _emit(account_id, f"[扫码登录] 扫码成功：uid={uid}，昵称={nickname or '-'}")
-                return True
+        uid, nickname, session_error = fetch_session_user(page, S.MUSICIAN_HOME_URL)
+        if uid:
+            _emit(account_id, f"[扫码登录] 扫码成功：uid={uid}，昵称={nickname or '-'}")
+            return True
+        if time.time() - last_status_log >= 15:
+            cookie_hint = "已检测到登录 Cookie" if has_login_cookie(cookies) else "尚未检测到登录 Cookie"
+            detail = f"，会话接口：{session_error}" if session_error else ""
+            _emit(account_id, f"[扫码登录] 等待扫码确认（{cookie_hint}{detail}）")
+            last_status_log = time.time()
 
         src = _grab_qr_data_uri(page)
         if src:
@@ -646,7 +652,12 @@ def login_account(profile_dir: str, phone: str, password: str, account_id: Optio
             pass
 
         # 登录方式：auto（密码优先，失败自动转扫码）/ password / qrcode
-        method = (repo.get_setting("login_method", LOGIN_METHOD) or LOGIN_METHOD).strip().lower()
+        account = repo.get_account(account_id) if account_id is not None else None
+        method = (
+            (account or {}).get("login_method")
+            or repo.get_setting("login_method", LOGIN_METHOD)
+            or LOGIN_METHOD
+        ).strip().lower()
         if method not in LOGIN_METHODS:
             method = "auto"
         use_qr = method == "qrcode"

@@ -28,6 +28,8 @@ services:
       # 通知（可选）
       - WECOM_WEBHOOK_KEY=
       - CUSTOM_WEBHOOK_URL=
+      - PUSHPLUS_TOKEN=
+      - PUSHPLUS_TOPIC=
     logging:
       driver: "json-file"
       options:

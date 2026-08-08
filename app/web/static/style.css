@@ -242,6 +242,50 @@ body {
   width: 640px;
 }
 
+.listen-modal-card {
+  width: 500px;
+}
+
+.modal-settings-card {
+  width: 900px;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+.settings-column {
+  min-width: 0;
+}
+
+.settings-compact-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.settings-password-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.settings-compact-grid label,
+.settings-password-grid label {
+  min-width: 0;
+}
+
+.settings-compact-grid input,
+.settings-password-grid input {
+  min-width: 0;
+}
+
+.settings-column > .section-title:first-child {
+  margin-top: 0;
+}
+
 .modal-head {
   display: flex;
   justify-content: space-between;
@@ -280,6 +324,7 @@ body {
 }
 
 .modal-card input[type=text],
+.modal-card input[type=url],
 .modal-card input[type=password],
 .modal-card input[type=number],
 .modal-card input[type=time],
@@ -296,6 +341,38 @@ body {
 .modal-card textarea {
   resize: vertical;
   font-family: inherit;
+}
+
+.listen-item-input {
+  display: flex;
+  gap: 8px;
+  margin-top: 5px;
+}
+
+.listen-config-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+
+.listen-item-input select,
+.listen-item-input input {
+  margin-top: 0;
+}
+
+.listen-item-input select {
+  width: 88px;
+  flex: 0 0 88px;
+}
+
+.listen-item-input input {
+  flex: 1;
+}
+
+@media (max-width: 560px) {
+  .listen-config-row {
+    grid-template-columns: 1fr;
+  }
 }
 
 .modal-card label.row input {
@@ -328,6 +405,38 @@ body {
 
 .confirm-text b {
   color: var(--text);
+}
+
+.listen-status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+  margin: 8px 0 6px;
+  padding: 11px 12px;
+  background: #f7f8fa;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.listen-status-grid b {
+  color: var(--text);
+  white-space: nowrap;
+}
+
+@media (max-width: 560px) {
+  .listen-status-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.error-text {
+  min-height: 18px;
+  margin: 4px 0 8px;
+  color: #c0392b;
+  font-size: 12px;
+  word-break: break-word;
 }
 
 .tag-global {
@@ -480,6 +589,16 @@ body {
 
   .modal-lg {
     width: 100%;
+  }
+
+  .modal-settings-card {
+    width: 100%;
+  }
+
+  .settings-compact-grid,
+  .settings-password-grid {
+    grid-template-columns: 1fr;
+    gap: 0;
   }
 }
 

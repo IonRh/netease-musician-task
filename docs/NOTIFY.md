@@ -1,15 +1,17 @@
 # 推送通知配置说明
 
-本项目支持两种推送通知方式：**自定义 Webhook**（优先）和**企业微信机器人**（兜底）。
+本项目支持四种推送通知方式：**企业微信机器人**、**自定义 Webhook**、**PushPlus**，以及关闭推送。
+
+网页“全局设置”中可以直接选择推送方式，默认是“不推送”。`自动（兼容旧配置）` 会按以下顺序选择：
 
 ---
 
 ## 配置优先级
 
 ```
-CUSTOM_WEBHOOK_URL 已填写 → 推送到自定义 Webhook
-CUSTOM_WEBHOOK_URL 未填写，WECOM_WEBHOOK_KEY 已填写 → 推送到企业微信
-两者均未填写 → 不推送
+CUSTOM_WEBHOOK_URL → PUSHPLUS_TOKEN → WECOM_WEBHOOK_KEY
+
+明确选择某个渠道后，只使用该渠道；选择“不推送”则关闭通知。
 ```
 
 ---
@@ -107,12 +109,11 @@ CUSTOM_WEBHOOK_BODY=${content}
 ### PushPlus（微信推送）
 
 ```env
-CUSTOM_WEBHOOK_URL=https://www.pushplus.plus/send
-CUSTOM_WEBHOOK_METHOD=POST
-CUSTOM_WEBHOOK_BODY={"token":"your_token","title":"${title}","content":"${content}","template":"txt"}
+PUSHPLUS_TOKEN=your_token
+PUSHPLUS_TOPIC=
 ```
 
-> `template` 支持 `txt`（纯文本）、`html`、`markdown` 等，建议用 `txt` 避免 HTML 转义。其他可选参数（`channel`、`option` 等）直接追加到 JSON 模板里即可。
+网页“全局设置”中填写 Token 和 Topic，消息统一使用 `txt` 纯文本模板。
 
 ---
 

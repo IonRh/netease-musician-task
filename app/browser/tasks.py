@@ -135,6 +135,163 @@ def do_checkin(profile_dir: str, account_id: Optional[int] = None) -> dict:
         return res
 
 
+def _read_playback_state(page: Page) -> dict[str, float | str]:
+    """从主页面和网易云 iframe 读取当前播放器状态。"""
+    script = """
+        () => {
+            const p = window.player;
+            try {
+                if (p && typeof p.getDuration === 'function' && p.getDuration() > 0) {
+                    let cur = Number(p.getPosition ? p.getPosition() : 0);
+                    let dur = Number(p.getDuration());
+                    if (dur < 10000) { cur *= 1000; dur *= 1000; }
+                    return {cur, dur, state: String(p.getState ? p.getState() : '')};
+                }
+            } catch (e) {}
+            const audio = document.querySelector('audio');
+            if (!audio) {
+                return {cur: 0, dur: 0, state: ''};
+            }
+            return {
+                cur: Number.isFinite(audio.currentTime)
+                    ? Math.max(0, audio.currentTime * 1000) : 0,
+                dur: Number.isFinite(audio.duration) && audio.duration > 0
+                    ? Math.max(0, audio.duration * 1000) : 0,
+                state: audio.paused ? 'paused' : 'playing',
+            };
+        }
+    """
+    for frame in page.frames:
+        try:
+            state = frame.evaluate(script)
+            if state and (
+                float(state.get("dur", 0)) > 0
+                or state.get("state") in {"paused", "playing", "play", "stop"}
+            ):
+                return state
+        except Exception:
+            continue
+
+    # 网易云网页播放器有时不暴露 window.player，也没有可直接读取的 audio
+    # 元素，但底部播放器的时间文本和进度条仍会正常更新。
+    dom_script = """
+        () => {
+            const timeNodes = Array.from(document.querySelectorAll(
+                '.m-playbar .time, .g-btmbar .time, .m-pbar .time'
+            ));
+            const toMs = (value) => {
+                const parts = String(value || '').trim().split(':').map(Number);
+                if (parts.length !== 2 || parts.some(Number.isNaN)) return 0;
+                return (parts[0] * 60 + parts[1]) * 1000;
+            };
+            for (const node of timeNodes) {
+                const text = (node.innerText || node.textContent || '').trim();
+                const matches = text.match(/(\\d{1,3}:\\d{2})\\s*\\/\\s*(\\d{1,3}:\\d{2})/);
+                if (!matches) continue;
+                const cur = toMs(matches[1]);
+                const dur = toMs(matches[2]);
+                if (dur <= 0) continue;
+                const button = document.querySelector('.m-playbar .ply, .g-btmbar .ply');
+                const buttonText = button
+                    ? `${button.className} ${button.title || ''} ${button.getAttribute('aria-label') || ''}`
+                    : '';
+                const state = /pause|暂停/i.test(buttonText) ? 'playing' : '';
+                return {cur, dur, state};
+            }
+            return {cur: 0, dur: 0, state: ''};
+        }
+    """
+    for frame in page.frames:
+        try:
+            state = frame.evaluate(dom_script)
+            if state and float(state.get("dur", 0)) > 0:
+                return state
+        except Exception:
+            continue
+    return {"cur": 0, "dur": 0, "state": ""}
+
+
+def _click_play_controls(page: Page, *, force: bool = False) -> bool:
+    """网易云播放按钮是 toggle；状态未知时不要反复点击。"""
+    if not force:
+        state = _read_playback_state(page).get("state")
+        if state not in {"paused", "stop"}:
+            return False
+
+    for selector in [".m-playbar .ply", ".g-btmbar .ply"]:
+        try:
+            loc = page.locator(selector)
+            if loc.count() > 0 and loc.first.is_visible():
+                loc.first.click(timeout=1500)
+                return True
+        except Exception:
+            continue
+    for frame in page.frames:
+        for selector in [".u-btni-play", '[data-res-action="play"]', "#playall", ".u-btn2-2"]:
+            try:
+                loc = frame.locator(selector)
+                if loc.count() > 0 and loc.first.is_visible():
+                    loc.first.click(timeout=1500)
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def do_listen_music(
+    profile_dir: str,
+    netease_item_id: str,
+    account_id: Optional[int] = None,
+    timeout_seconds: int = 1200,
+) -> dict:
+    """打开歌曲并完整播放，供互助服务的 /next 与 /play/finish 使用。"""
+    item_id = str(netease_item_id or "").strip()
+    item_kind, target_id = "song", item_id
+    if item_id.startswith("album:"):
+        item_kind, target_id = "album", item_id[6:].strip()
+    if not target_id.isdigit():
+        return {"ok": False, "message": f"无效的歌曲/专辑 ID：{item_id}"}
+
+    bus.status(account_id, "running", f"播放听歌任务：{item_id}")
+    with run_with_context(profile_dir, account_id=account_id, label="听歌") as (context, page):
+        if not _validate_session(page, account_id):
+            return {"ok": False, "auth_valid": False, "message": "cookie expired"}
+        page.goto(
+            f"https://music.163.com/#/{item_kind}?id={target_id}",
+            wait_until="domcontentloaded",
+        )
+        page.wait_for_timeout(3000)
+        # 首次进入歌曲页只尝试一次。播放按钮是 toggle，不能在状态未知时
+        # 周期性点击，否则会出现播放一下又暂停一下。
+        _click_play_controls(page, force=True)
+        deadline = time.time() + timeout_seconds
+        last_progress = 0.0
+        last_log = 0.0
+        while time.time() < deadline:
+            state = _read_playback_state(page)
+            cur = float(state.get("cur", 0))
+            dur = float(state.get("dur", 0))
+            if dur > 0 and cur >= dur - 2500:
+                _emit(account_id, f"听歌完成：{item_id}（{dur / 1000:.0f} 秒）")
+                bus.status(account_id, "done", "听歌任务完成")
+                return {
+                    "ok": True,
+                    "item_id": item_id,
+                    "played_ms": int(cur),
+                    "duration_ms": int(dur),
+                    "cookie_str": cookies_to_str(context.cookies("https://music.163.com")),
+                }
+            if state.get("state") in {"paused", "stop"}:
+                _click_play_controls(page)
+            if cur > last_progress:
+                last_progress = cur
+            if time.time() - last_log >= 15:
+                _emit(account_id, f"听歌播放中：{item_id}，进度 {cur / 1000:.0f}/{dur / 1000:.0f} 秒")
+                last_log = time.time()
+            time.sleep(2)
+        _emit(account_id, f"听歌超时：{item_id}", "warn")
+        return {"ok": False, "message": "播放超时"}
+
 # ---------- 每日整体流程（签到 +（可选）间隔任务，同一浏览器不关闭）----------
 def do_daily_run(
     profile_dir: str,

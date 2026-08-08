@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import time
+import requests
 from datetime import datetime
 from typing import Optional
 
@@ -98,6 +99,104 @@ def run_checkin(account_id: int) -> dict:
     return res
 
 
+def run_listen(account_id: int) -> dict:
+    acc = repo.get_account(account_id)
+    if not acc:
+        return {"ok": False, "message": "account not found"}
+    api_url = (repo.get_setting("listen_api_url", "") or acc.get("listen_api_url") or "").strip()
+    if not api_url:
+        return {"ok": False, "message": "未配置听歌 API 地址，请先点击「加入听歌」"}
+
+    from app.api.listen import _account_md5, _hourly_apikey, _server_url
+    from app.browser.tasks import do_listen_music
+
+    account_md5 = _account_md5(acc["phone"])
+    apikey = _hourly_apikey(account_md5)
+    headers = {"X-API-Key": apikey}
+    try:
+        next_resp = requests.get(
+            _server_url(api_url, "/api/next"),
+            headers=headers,
+            timeout=10,
+        )
+        if next_resp.status_code == 404:
+            return {"ok": False, "message": "听歌服务暂无可播放任务"}
+        if not 200 <= next_resp.status_code < 300:
+            return {"ok": False, "message": f"获取听歌任务失败：HTTP {next_resp.status_code}"}
+        next_data = next_resp.json() or {}
+        target = str(next_data.get("netease_item_id") or "").strip()
+        owner_md5 = str(next_data.get("account_md5") or "").strip()
+        if not target:
+            return {"ok": False, "message": "听歌服务未返回歌曲 ID"}
+
+        repo.add_log(account_id, "listen", "info", f"开始播放歌曲：{target}")
+        result = _run_blocking(do_listen_music, acc["profile_dir"], target, account_id)
+        if not result.get("ok"):
+            repo.update_account(
+                account_id,
+                listen_status="error",
+                listen_error=result.get("message", "播放失败"),
+            )
+            repo.add_log(account_id, "listen", "fail", result.get("message", "播放失败"))
+            return result
+
+        finish_resp = requests.post(
+            _server_url(api_url, "/api/play/finish"),
+            json={"account_md5": owner_md5 or account_md5, "netease_item_id": target},
+            headers=headers,
+            timeout=10,
+        )
+        if not 200 <= finish_resp.status_code < 300:
+            message = f"提交听歌结果失败：HTTP {finish_resp.status_code}"
+            repo.add_log(account_id, "listen", "fail", message)
+            repo.update_account(account_id, listen_status="error", listen_error=message)
+            return {"ok": False, "message": message}
+        repo.update_account(
+            account_id,
+            listen_status="normal",
+            listen_error="",
+            listen_play_count=(acc.get("listen_play_count") or 0) + 1,
+            listen_last_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        repo.add_log(account_id, "listen", "success", f"听歌完成：{target}")
+        return {"ok": True, "message": f"听歌完成：{target}"}
+    except requests.RequestException as exc:
+        message = f"连接听歌 API 失败：{exc}"
+        repo.update_account(account_id, listen_status="error", listen_error=message)
+        repo.add_log(account_id, "listen", "fail", message)
+        return {"ok": False, "message": message}
+
+def run_auto_listen_for_account(account_id: int) -> None:
+    """在全局听歌开始时间执行已加入账号的每日听歌任务。"""
+    acc = repo.get_account(account_id)
+    if not acc or not acc["enabled"] or acc.get("listen_status") != "normal":
+        return
+    if not (repo.get_setting("listen_api_url", "") or "").strip():
+        return
+    if not (repo.get_setting("listen_item_id", "") or "").strip():
+        return
+
+    daily_max = max(0, repo.get_setting_int("listen_daily_max", 1))
+    monthly_max = max(0, repo.get_setting_int("listen_monthly_max", 30))
+    today_count = repo.count_success_logs_today(account_id, "listen")
+    month_count = repo.count_success_logs_this_month(account_id, "listen")
+    completed = 0
+    while (
+        today_count + completed < daily_max
+        and month_count + completed < monthly_max
+    ):
+        result = run_listen(account_id)
+        if not result.get("ok"):
+            break
+        completed += 1
+    if completed:
+        _emit_run(
+            account_id,
+            f"自动听歌完成：{completed} 首"
+            f"（今日 {today_count + completed}/{daily_max}，"
+            f"本月 {month_count + completed}/{monthly_max}）",
+        )
+
 # ---------- 间隔任务（发布动态 / VIP 领取）----------
 def _month_tag() -> str:
     return datetime.now().strftime("%Y-%m")
@@ -189,7 +288,7 @@ def _emit_run(account_id: int, line: str) -> None:
 
 def _notify_manual_result(account_id: int, acc: dict, tasks: list[str], lines: list[str], *, ok: bool) -> None:
     """发送网页手动执行结果；通知失败不影响任务本身。"""
-    task_names = {"checkin": "签到", "publish": "发布动态", "vip": "领取 VIP"}
+    task_names = {"checkin": "签到", "publish": "发布动态", "vip": "领取 VIP", "listen": "听歌"}
     selected = "、".join(task_names[t] for t in tasks if t in task_names)
     account_name = account_label(account_id, account=acc)
     content = "\n".join([
@@ -226,6 +325,7 @@ def run_selected(account_id: int, tasks: list[str]) -> None:
     want_checkin = "checkin" in tasks
     want_vip = "vip" in tasks
     want_publish = "publish" in tasks
+    want_listen = "listen" in tasks
     run_interval = want_vip or want_publish
     interval_kind = "vip" if want_vip else "publish"
 
@@ -238,15 +338,18 @@ def run_selected(account_id: int, tasks: list[str]) -> None:
 
     publish_msg = f"{datetime.now().strftime('%Y年%m月%d日 %H:%M')} 分享音乐"
     try:
-        res = _run_blocking(
-            do_daily_run,
-            acc["profile_dir"],
-            account_id,
-            run_checkin=want_checkin,
-            run_interval=run_interval,
-            interval_kind=interval_kind,
-            publish_msg=publish_msg,
-        )
+        if want_checkin or run_interval:
+            res = _run_blocking(
+                do_daily_run,
+                acc["profile_dir"],
+                account_id,
+                run_checkin=want_checkin,
+                run_interval=run_interval,
+                interval_kind=interval_kind,
+                publish_msg=publish_msg,
+            )
+        else:
+            res = {"ok": True, "auth_valid": True}
     except Exception as e:  # noqa: BLE001
         logger.exception("手动执行任务异常")
         repo.add_log(account_id, "manual", "fail", str(e))
@@ -300,6 +403,12 @@ def run_selected(account_id: int, tasks: list[str]) -> None:
     if run_interval and interval is None:
         all_ok = False
         result_lines.append(f"{'VIP 领取' if interval_kind == 'vip' else '发布动态'}：未返回执行结果")
+
+    if want_listen:
+        listen_result = run_listen(account_id)
+        listen_ok = bool(listen_result.get("ok"))
+        all_ok = all_ok and listen_ok
+        result_lines.append(f"听歌：{listen_result.get('message', '未完成')}")
 
     _notify_manual_result(account_id, acc, tasks, result_lines, ok=all_ok)
 

@@ -1,5 +1,5 @@
 """
-通知：企业微信 / 自定义 Webhook。配置从 settings 表读取（运行期可改）。
+通知：企业微信 / 自定义 Webhook / PushPlus。配置从 settings 表读取（运行期可改）。
 从原 wecom_notify.py 迁移。
 """
 
@@ -34,6 +34,34 @@ def send_wecom_webhook(webhook_key: str, content: str, *, title: str | None = No
             return False
         data = resp.json() if resp.content else {}
         return isinstance(data, dict) and data.get("errcode", 0) == 0
+    except Exception:
+        return False
+
+def send_pushplus(
+    token: str,
+    content: str,
+    *,
+    title: str | None = None,
+    topic: str | None = None,
+    timeout: int = 10,
+) -> bool:
+    """通过 PushPlus 官方 send 接口发送消息。"""
+    if not token:
+        return False
+    payload = {
+        "token": token,
+        "title": title or "网易音乐人任务",
+        "content": _truncate(content or ""),
+        "template": "txt",
+    }
+    if topic:
+        payload["topic"] = topic
+    try:
+        resp = requests.post("https://www.pushplus.plus/send", json=payload, timeout=timeout)
+        if not 200 <= resp.status_code < 300:
+            return False
+        data = resp.json() if resp.content else {}
+        return isinstance(data, dict) and str(data.get("code", "")) == "200"
     except Exception:
         return False
 
@@ -131,12 +159,37 @@ def send_configured_notification(
     event: str = "notification",
     extra: dict | None = None,
 ) -> bool:
-    """优先自定义 Webhook，其次企业微信。配置从 settings 表读。"""
+    """按设置选择通知渠道；auto 模式兼容旧版优先级。"""
+    method = (get_setting("notification_method", "none") or "none").lower()
     custom_url = get_setting("custom_webhook_url", "") or ""
     wecom_key = get_setting("wecom_webhook_key", "") or ""
+    pushplus_token = get_setting("pushplus_token", "") or ""
     try:
+        if method == "none":
+            return False
+        if method == "custom":
+            return send_custom_webhook(custom_url, content, title=title, timeout=timeout, event=event, extra=extra)
+        if method == "wecom":
+            return send_wecom_webhook(wecom_key, content, title=title, timeout=timeout)
+        if method == "pushplus":
+            return send_pushplus(
+                pushplus_token,
+                content,
+                title=title,
+                topic=get_setting("pushplus_topic", "") or "",
+                timeout=timeout,
+            )
+        # auto：保留已有配置的行为，并允许仅配置 PushPlus 的新部署直接工作。
         if custom_url:
             return send_custom_webhook(custom_url, content, title=title, timeout=timeout, event=event, extra=extra)
+        if pushplus_token:
+            return send_pushplus(
+                pushplus_token,
+                content,
+                title=title,
+                topic=get_setting("pushplus_topic", "") or "",
+                timeout=timeout,
+            )
         if wecom_key:
             return send_wecom_webhook(wecom_key, content, title=title, timeout=timeout)
     except Exception as e:  # noqa: BLE001
