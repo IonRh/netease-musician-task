@@ -125,7 +125,6 @@ def run_listen(account_id: int) -> dict:
             return {"ok": False, "message": f"获取听歌任务失败：HTTP {next_resp.status_code}"}
         next_data = next_resp.json() or {}
         target = str(next_data.get("netease_item_id") or "").strip()
-        owner_md5 = str(next_data.get("account_md5") or "").strip()
         if not target:
             return {"ok": False, "message": "听歌服务未返回歌曲 ID"}
 
@@ -142,7 +141,7 @@ def run_listen(account_id: int) -> dict:
 
         finish_resp = requests.post(
             _server_url(api_url, "/api/play/finish"),
-            json={"account_md5": owner_md5 or account_md5, "netease_item_id": target},
+            json={"account_md5": account_md5, "netease_item_id": target},
             headers=headers,
             timeout=10,
         )
