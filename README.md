@@ -89,7 +89,7 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 2. 在账号列表中点击「听歌配置」→「加入听歌」。
 3. 加入后，账号会在设定时间自动执行听歌任务。
 4. 在「听歌配置」中可以查看听歌和被听进度，也可以退出共享听歌。
-5. 公益API地址（除歌曲和专辑外，未涉及其他敏感信息）：https://listen-api.badking.pp.ua/
+5. 公益API地址（除歌曲和专辑（共享池需要）外，未涉及其他敏感信息）：https://listen-api.badking.pp.ua/
 6. API开源部署地址：[netease-musician-task-server-api](https://github.com/IonRh/netease-musician-task-server-api)
 
 自动听歌会按服务端分配的歌曲执行，并受每日和每月上限限制，被听任务上线受所设置的每日和每月听歌上限所影响。
