@@ -141,9 +141,19 @@ def fetch_session_user(page: Page, home_url: str) -> tuple[Optional[str], Option
             page.goto(home_url, wait_until="domcontentloaded")
         result = page.evaluate(
             f"""async () => {{
-                const r = await fetch({ACCOUNT_INFO_URL!r}, {{
-                    method: 'GET', credentials: 'include', cache: 'no-store'
-                }});
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 5000);
+                let r;
+                try {{
+                    r = await fetch({ACCOUNT_INFO_URL!r}, {{
+                        method: 'GET',
+                        credentials: 'include',
+                        cache: 'no-store',
+                        signal: controller.signal
+                    }});
+                }} finally {{
+                    clearTimeout(timer);
+                }}
                 if (!r.ok) return {{__http_status: r.status}};
                 return await r.json();
             }}"""
@@ -156,12 +166,24 @@ def fetch_session_user(page: Page, home_url: str) -> tuple[Optional[str], Option
     if result.get("__http_status"):
         return None, None, f"账号信息接口 HTTP {result['__http_status']}"
 
-    profile = result.get("profile") or {}
-    account = result.get("account") or {}
-    uid = profile.get("userId") if isinstance(profile, dict) else None
-    nickname = profile.get("nickname") if isinstance(profile, dict) else None
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    profile = result.get("profile") or data.get("profile") or {}
+    account = result.get("account") or data.get("account") or {}
+    uid = None
+    nickname = None
+    if isinstance(profile, dict):
+        uid = profile.get("userId") or profile.get("id") or profile.get("uid")
+        nickname = profile.get("nickname") or profile.get("userName")
     if uid is None and isinstance(account, dict):
-        uid = account.get("id")
+        uid = account.get("id") or account.get("userId") or account.get("uid")
+        nickname = nickname or account.get("userName") or account.get("nickname")
+    if uid is None:
+        uid = (
+            result.get("userId")
+            or result.get("uid")
+            or data.get("userId")
+            or data.get("uid")
+        )
     if uid is None:
         code = result.get("code")
         return None, None, f"账号信息接口未返回 uid（code={code!r}）"

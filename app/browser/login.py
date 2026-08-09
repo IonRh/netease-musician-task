@@ -515,6 +515,19 @@ def _grab_qr_data_uri(page: Page) -> Optional[str]:
     return None
 
 
+def _cookie_fingerprint(cookies: list[dict]) -> tuple[tuple[str, str, str], ...]:
+    """生成不写入日志的 Cookie 变化指纹。"""
+    return tuple(sorted(
+        (
+            str(cookie.get("name") or ""),
+            str(cookie.get("domain") or ""),
+            str(cookie.get("value") or ""),
+        )
+        for cookie in cookies
+        if cookie.get("name")
+    ))
+
+
 def login_with_qrcode(
     page: Page,
     account_id: Optional[int],
@@ -537,27 +550,70 @@ def login_with_qrcode(
     misses = 0
     reloads = 0
     last_status_log = 0.0
+    qr_login_state = {"status": None, "authorized": False}
+
+    def _watch_qr_login_response(response) -> None:
+        """读取登录页二维码轮询接口，避免只依赖 Cookie 判断扫码结果。"""
+        if qr_login_state["authorized"]:
+            # 803 后可能还有之前已发出的轮询请求返回 800，
+            # 不能让过期状态覆盖已经确认成功的状态。
+            return
+        url = response.url.lower()
+        if (
+            "qrcode/check" not in url
+            and "/qr/check" not in url
+            and "login/qrcode" not in url
+            and "login/qr" not in url
+        ):
+            return
+        try:
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            code = (
+                payload.get("code")
+                if isinstance(payload, dict)
+                else None
+            )
+            if isinstance(data, dict):
+                code = data.get("code", code)
+            if code is None:
+                return
+            code = int(code)
+            if code not in (800, 801, 802, 803):
+                # 200 等通常只是接口请求成功，不代表二维码业务状态。
+                return
+            if code != qr_login_state["status"]:
+                qr_login_state["status"] = code
+                status_text = {
+                    800: "二维码已过期",
+                    801: "等待扫码",
+                    802: "已扫码等待确认",
+                    803: "扫码确认成功",
+                }.get(code, f"未知状态（{code}）")
+                _emit(account_id, f"[扫码登录] 二维码状态：{status_text}")
+            if code == 803:
+                qr_login_state["authorized"] = True
+        except Exception:
+            # 页面上的其他登录请求或非 JSON 响应不影响轮询流程。
+            pass
+
+    page.on("response", _watch_qr_login_response)
+    # 登录页上的账号接口可能返回 code=200 但没有 uid，因此在二维码显示后
+    # 记录 Cookie，等扫码带来会话变化后再跳转到音乐人首页确认。
+    cookies_before: Optional[tuple[tuple[str, str, str], ...]] = None
+    session_navigation_done = False
     while time.time() < deadline:
         _ensure_no_network_risk(page, account_id, "扫码登录期间")
-
-        # 服务端确认登录态优先于一切。不能只依赖 MUSIC_U/__csrf：
-        # 网易云扫码成功后可能先更新服务端会话，Cookie 写入会稍晚或使用其他 Cookie。
         cookies = page.context.cookies("https://music.163.com")
-        uid, nickname, session_error = fetch_session_user(page, S.MUSICIAN_HOME_URL)
-        if uid:
-            _emit(account_id, f"[扫码登录] 扫码成功：uid={uid}，昵称={nickname or '-'}")
-            return True
-        if time.time() - last_status_log >= 15:
-            cookie_hint = "已检测到登录 Cookie" if has_login_cookie(cookies) else "尚未检测到登录 Cookie"
-            detail = f"，会话接口：{session_error}" if session_error else ""
-            _emit(account_id, f"[扫码登录] 等待扫码确认（{cookie_hint}{detail}）")
-            last_status_log = time.time()
 
+        # 先抓取并展示二维码，避免账号接口检查的等待时间遮住二维码生成。
         src = _grab_qr_data_uri(page)
         if src:
             misses = 0
             if src != last_src:
                 last_src = src
+                if cookies_before is None:
+                    cookies_before = _cookie_fingerprint(cookies)
                 # data URI 直接推给前端 <img>，不经任何第三方服务
                 bus.qrcode(account_id, src, tip="请用网易云音乐 App 扫码登录")
                 _notify_qr(
@@ -576,8 +632,40 @@ def login_with_qrcode(
                 reloads += 1
                 misses = 0
                 last_src = None
+                cookies_before = None
                 _emit(account_id, f"[扫码登录] 未取到二维码，重新加载登录页（第 {reloads} 次）", "warn")
                 _open_login_page(page)
+
+        if qr_login_state["authorized"] and not session_navigation_done:
+            _emit(account_id, "[扫码登录] 已收到扫码确认，正在跳转到音乐人首页确认登录")
+            try:
+                page.goto(S.MUSICIAN_HOME_URL, wait_until="domcontentloaded", timeout=20000)
+                session_navigation_done = True
+            except Exception as exc:  # noqa: BLE001
+                _emit(account_id, f"[扫码登录] 跳转音乐人首页失败，将继续重试：{exc}", "warn")
+
+        # 服务端确认登录态优先于一切。不能只依赖 MUSIC_U/__csrf：
+        # 网易云扫码成功后可能先更新服务端会话，Cookie 写入会稍晚或使用其他 Cookie。
+        cookie_changed = (
+            cookies_before is not None
+            and _cookie_fingerprint(cookies) != cookies_before
+        )
+        if cookie_changed and not session_navigation_done:
+            _emit(account_id, "[扫码登录] 检测到会话 Cookie 已更新，正在跳转到音乐人首页确认登录")
+            try:
+                page.goto(S.MUSICIAN_HOME_URL, wait_until="domcontentloaded", timeout=20000)
+                session_navigation_done = True
+            except Exception as exc:  # noqa: BLE001
+                _emit(account_id, f"[扫码登录] 跳转音乐人首页失败，将继续重试：{exc}", "warn")
+        uid, nickname, session_error = fetch_session_user(page, S.MUSICIAN_HOME_URL)
+        if uid:
+            _emit(account_id, f"[扫码登录] 扫码成功：uid={uid}，昵称={nickname or '-'}")
+            return True
+        if time.time() - last_status_log >= 15:
+            cookie_hint = "已检测到登录 Cookie" if has_login_cookie(cookies) else "尚未检测到登录 Cookie"
+            detail = f"，会话接口：{session_error}" if session_error else ""
+            _emit(account_id, f"[扫码登录] 等待扫码确认（{cookie_hint}{detail}）")
+            last_status_log = time.time()
 
         time.sleep(2)
 

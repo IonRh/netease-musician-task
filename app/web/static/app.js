@@ -33,6 +33,26 @@ function openRunModal(title, accountId) {
   $("#log-box").innerHTML = "";
   hideQR();
   $("#modal-run").classList.remove("hidden");
+  if (accountId != null) {
+    loadLatestQR(accountId);
+  }
+}
+async function loadLatestQR(accountId) {
+  // WebSocket 连接尚未建立或二维码事件早于弹窗打开时，主动回读缓存。
+  for (const delay of [0, 500, 1500, 3000]) {
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    if (viewingAccountId !== Number(accountId)) return;
+    try {
+      const data = await api(`/api/tasks/${accountId}/live`);
+      if (viewingAccountId !== Number(accountId)) return;
+      if (data.qr && data.qr.qr_url) {
+        showQR(data.qr.qr_url, data.qr.tip);
+        return;
+      }
+    } catch (_) {
+      // WebSocket/任务启动瞬间接口可能尚未可用，继续下一轮尝试。
+    }
+  }
 }
 async function openViewModal(accountId, phone) {
   // 查看：拉取累积日志（不清空），继续接收实时更新
