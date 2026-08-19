@@ -96,6 +96,16 @@
           </select>
         </label>
         <label>运行时间 <input id="in-runtime" type="time" /></label>
+        <label>账号角色
+          <select id="in-account-role">
+            <option value="musician">音乐人账号</option>
+            <option value="player">普通播放账号</option>
+          </select>
+        </label>
+        <label class="row"><input id="in-local-listen-enabled" type="checkbox" /> 加入本机账号互助</label>
+        <label>希望被播放的歌曲/专辑 ID
+          <textarea id="in-local-listen-item" rows="3" placeholder="音乐人账号可填写多个 ID；专辑用 album:ID"></textarea>
+        </label>
         <div class="modal-actions">
           <button class="btn" data-close>取消</button>
           <button class="btn btn-primary" id="btn-save-add">保存并登录</button>
@@ -123,6 +133,16 @@
         <label class="row"
           ><input id="edit-enabled" type="checkbox" /> 启用</label
         >
+        <label>账号角色
+          <select id="edit-account-role">
+            <option value="musician">音乐人账号</option>
+            <option value="player">普通播放账号</option>
+          </select>
+        </label>
+        <label class="row"><input id="edit-local-listen-enabled" type="checkbox" /> 加入本机账号互助</label>
+        <label>希望被播放的歌曲/专辑 ID
+          <textarea id="edit-local-listen-item" rows="3" placeholder="多个 ID 用逗号、空格或换行分隔；专辑用 album:ID"></textarea>
+        </label>
         <div class="modal-actions">
           <button class="btn" data-close>取消</button>
           <button class="btn btn-primary" id="btn-save-edit">保存</button>
@@ -165,6 +185,15 @@
                   <input id="set-listen-item-id" type="text" placeholder="ID" />
                 </div>
               </label>
+            </div>
+            <label class="row">互助客户端 Token <input id="set-listen-client-token" type="password" autocomplete="off" placeholder="由互助服务端生成" /></label>
+            <p class="hint-text">公共互助会把账号播放记录发送到第三方服务，请确认服务可信，并自行承担账号风控风险。</p>
+            <div class="section-title">本地账号互助</div>
+            <div class="settings-compact-grid">
+              <label>当天最多听 <input id="set-local-listen-daily-max" type="number" min="0" /></label>
+              <label>当月最多听 <input id="set-local-listen-monthly-max" type="number" min="0" /></label>
+              <label>播放比例 <input id="set-local-listen-percent" type="number" min="34" max="100" /></label>
+              <label>开始时间 <input id="set-local-listen-start-time" type="time" /></label>
             </div>
             <div class="section-title">修改管理密码</div>
             <div class="settings-password-grid">
@@ -277,7 +306,10 @@
           权益</label
         >
         <label class="row"
-          ><input type="checkbox" class="run-task" value="listen" /> 听歌</label
+          ><input type="checkbox" class="run-task" value="listen" /> 公共互助听歌</label
+        >
+        <label class="row"
+          ><input type="checkbox" class="run-task" value="local_listen" /> 本地互助听歌</label
         >
         <p class="hint-text">
           提示：发布动态与领取 VIP 同时勾选时，本次优先执行 VIP。

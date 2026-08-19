@@ -147,14 +147,20 @@ async function loadAccounts() {
       ? escapeHtml(a.run_time)
       : `${escapeHtml(globalSendTime)} <span class="tag-global">全局</span>`;
     const running = runningAccountId === a.id;
-    const actionBtn = running
-      ? `<button class="btn btn-sm btn-view" data-act="view" data-id="${a.id}" data-phone="${escapeHtml(a.phone)}">查看</button>`
-      : `<button class="btn btn-sm" data-act="run" data-id="${a.id}" data-phone="${escapeHtml(a.phone)}">执行</button>`;
+   const actionBtn = running
+     ? `<button class="btn btn-sm btn-view" data-act="view" data-id="${a.id}" data-phone="${escapeHtml(a.phone)}">查看</button>`
+      : `<button class="btn btn-sm" data-act="run" data-id="${a.id}" data-phone="${escapeHtml(a.phone)}" data-role="${a.account_role || "musician"}">执行</button>`;
     const enabled = !!a.enabled;
-    const enabledBadge = enabled
-      ? `<span class="badge ok">启用</span>`
-      : `<span class="badge expired">暂停</span>`;
-    const toggleBtn = `<button class="btn btn-sm" data-act="toggle" data-id="${a.id}" data-enabled="${enabled ? 1 : 0}">${enabled ? "暂停" : "启用"}</button>`;
+    let enabledBadge = enabled
+     ? `<span class="badge ok">启用</span>`
+     : `<span class="badge expired">暂停</span>`;
+    if (a.local_listen_enabled) {
+      enabledBadge += ` <span class="badge unknown">本地互助 帮${a.local_listen_helped_today || 0}/被${a.local_listen_received_today || 0}</span>`;
+    }
+   const toggleBtn = `<button class="btn btn-sm" data-act="toggle" data-id="${a.id}" data-enabled="${enabled ? 1 : 0}">${enabled ? "暂停" : "启用"}</button>`;
+    const listenConfigBtn = a.account_role === "player"
+      ? ""
+      : `<button class="btn btn-sm" data-act="listen-join" data-id="${a.id}" data-phone="${escapeHtml(a.phone)}">听歌配置</button>`;
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td data-label="手机号">${escapeHtml(a.phone)}</td>
@@ -165,7 +171,7 @@ async function loadAccounts() {
       <td data-label="本月发布">${a.monthly_sends || 0}</td>
       <td data-label="操作" class="cell-actions">
         <button class="btn btn-sm btn-primary" data-act="login" data-id="${a.id}" data-phone="${escapeHtml(a.phone)}">登录</button>
-        <button class="btn btn-sm" data-act="listen-join" data-id="${a.id}" data-phone="${escapeHtml(a.phone)}">听歌配置</button>
+        ${listenConfigBtn}
         ${actionBtn}
         ${toggleBtn}
         <button class="btn btn-sm" data-act="edit" data-id="${a.id}">编辑</button>
@@ -205,7 +211,7 @@ $("#acc-body").addEventListener("click", async (e) => {
     } else if (act === "listen-join") {
       openListenJoin(id, btn.dataset.phone);
     } else if (act === "run") {
-      openRunSelect(id, btn.dataset.phone);
+      openRunSelect(id, btn.dataset.phone, btn.dataset.role);
     } else if (act === "toggle") {
       const next = btn.dataset.enabled === "1" ? false : true;
       await api(`/api/accounts/${id}`, {
@@ -274,9 +280,13 @@ $("#btn-join-listen").addEventListener("click", async () => {
   const account_id = Number($("#listen-account-id").value);
   const settings = await api("/api/settings");
   const api_url = settings.listen_api_url?.trim() || "";
+  const client_token = settings.listen_client_token?.trim() || "";
   const raw_item_id = settings.listen_item_id?.trim() || "";
-  if (!api_url || !raw_item_id) {
-    alert("请先在全局设置中填写听歌 API 地址和歌曲/专辑 ID");
+  if (!api_url || !raw_item_id || !client_token) {
+    alert("请先在全局设置中填写听歌 API 地址、客户端 Token 和歌曲/专辑 ID");
+    return;
+  }
+  if (!confirm("公共互助会将此账号加入共享播放池，并把播放记录发送到配置的服务端。该服务可能带来账号风控风险，是否继续？")) {
     return;
   }
   try {
@@ -326,12 +336,15 @@ $("#btn-confirm-login").addEventListener("click", async () => {
 });
 
 // ---------- 执行任务多选 ----------
-function openRunSelect(id, phone) {
+function openRunSelect(id, phone, role = "musician") {
   $("#run-account-id").value = id;
   $("#run-account-id").dataset.phone = phone || `#${id}`;
   document
     .querySelectorAll(".run-task")
-    .forEach((c) => (c.checked = c.value === "checkin"));
+    .forEach((c) => {
+      c.disabled = role === "player" && c.value !== "local_listen";
+      c.checked = role === "player" ? c.value === "local_listen" : c.value === "checkin";
+    });
   $("#modal-run-select").classList.remove("hidden");
 }
 $("#btn-confirm-run").addEventListener("click", async () => {
@@ -398,13 +411,24 @@ function refreshAddLoginFields() {
 }
 
 $("#in-login-method").addEventListener("change", refreshAddLoginFields);
+function refreshAddLocalFields() {
+  const player = $("#in-account-role").value === "player";
+  $("#in-local-listen-enabled").disabled = player;
+  $("#in-local-listen-item").disabled = player;
+  if (player) $("#in-local-listen-enabled").checked = true;
+}
+$("#in-account-role").addEventListener("change", refreshAddLocalFields);
 
 $("#btn-add").addEventListener("click", () => {
   $("#in-phone").value = "";
   $("#in-password").value = "";
   $("#in-login-method").value = "auto";
   $("#in-runtime").value = globalSendTime || "";
+  $("#in-account-role").value = "musician";
+  $("#in-local-listen-enabled").checked = false;
+  $("#in-local-listen-item").value = "";
   refreshAddLoginFields();
+  refreshAddLocalFields();
   $("#modal-add").classList.remove("hidden");
 });
 $("#btn-save-add").addEventListener("click", async () => {
@@ -412,6 +436,9 @@ $("#btn-save-add").addEventListener("click", async () => {
   const password = $("#in-password").value;
   const login_method = $("#in-login-method").value;
   const run_time = $("#in-runtime").value.trim() || null;
+  const account_role = $("#in-account-role").value;
+  const local_listen_enabled = $("#in-local-listen-enabled").checked;
+  const local_listen_item_id = $("#in-local-listen-item").value.trim();
   if (!phone) {
     alert("请填写手机号");
     return;
@@ -423,7 +450,10 @@ $("#btn-save-add").addEventListener("click", async () => {
   try {
     const acc = await api("/api/accounts", {
       method: "POST",
-      body: JSON.stringify({ phone, password, login_method, run_time }),
+      body: JSON.stringify({
+        phone, password, login_method, run_time,
+        account_role, local_listen_enabled, local_listen_item_id,
+      }),
     });
     $("#modal-add").classList.add("hidden");
     openRunModal(`账号 ${phone} 登录中`, acc.id);
@@ -443,8 +473,19 @@ async function openEdit(id) {
   $("#edit-runtime").value = a.run_time || "";
   $("#edit-interval").value = a.interval_days || "";
   $("#edit-enabled").checked = !!a.enabled;
+  $("#edit-account-role").value = a.account_role || "musician";
+  $("#edit-local-listen-enabled").checked = !!a.local_listen_enabled;
+  $("#edit-local-listen-item").value = a.local_listen_item_id || "";
+  refreshEditLocalFields();
   $("#modal-edit").classList.remove("hidden");
 }
+function refreshEditLocalFields() {
+  const player = $("#edit-account-role").value === "player";
+  $("#edit-local-listen-enabled").disabled = player;
+  $("#edit-local-listen-item").disabled = player;
+  if (player) $("#edit-local-listen-enabled").checked = true;
+}
+$("#edit-account-role").addEventListener("change", refreshEditLocalFields);
 $("#btn-save-edit").addEventListener("click", async () => {
   const id = $("#edit-id").value;
   const payload = {};
@@ -455,6 +496,9 @@ $("#btn-save-edit").addEventListener("click", async () => {
   if (rt) payload.run_time = rt;
   if (iv) payload.interval_days = parseInt(iv, 10);
   payload.enabled = $("#edit-enabled").checked;
+  payload.account_role = $("#edit-account-role").value;
+  payload.local_listen_enabled = $("#edit-local-listen-enabled").checked;
+  payload.local_listen_item_id = $("#edit-local-listen-item").value.trim();
   try {
     await api(`/api/accounts/${id}`, {
       method: "PATCH",
@@ -487,6 +531,11 @@ $("#btn-settings").addEventListener("click", async () => {
   $("#set-listen-monthly-max").value = s.listen_monthly_max || "30";
   $("#set-listen-start-time").value = s.listen_start_time || s.default_send_time || "09:30";
   $("#set-listen-api-url").value = s.listen_api_url || "";
+  $("#set-listen-client-token").value = s.listen_client_token || "";
+  $("#set-local-listen-daily-max").value = s.local_listen_daily_max || "25";
+  $("#set-local-listen-monthly-max").value = s.local_listen_monthly_max || "650";
+  $("#set-local-listen-percent").value = s.local_listen_play_percent || "34";
+  $("#set-local-listen-start-time").value = s.local_listen_start_time || "10:00";
   const listenItem = s.listen_item_id || "";
   if (listenItem.startsWith("album:")) {
     $("#set-listen-item-type").value = "album";
@@ -519,6 +568,11 @@ $("#btn-save-settings").addEventListener("click", async () => {
     listen_monthly_max: $("#set-listen-monthly-max").value.trim() || "0",
     listen_start_time: $("#set-listen-start-time").value.trim() || "09:30",
     listen_api_url: $("#set-listen-api-url").value.trim(),
+    listen_client_token: $("#set-listen-client-token").value.trim(),
+    local_listen_daily_max: $("#set-local-listen-daily-max").value.trim() || "0",
+    local_listen_monthly_max: $("#set-local-listen-monthly-max").value.trim() || "0",
+    local_listen_play_percent: $("#set-local-listen-percent").value.trim() || "34",
+    local_listen_start_time: $("#set-local-listen-start-time").value.trim() || "10:00",
     listen_item_id: $("#set-listen-item-type").value === "album"
       ? `album:${$("#set-listen-item-id").value.trim()}`
       : $("#set-listen-item-id").value.trim(),

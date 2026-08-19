@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS accounts (
     listen_play_count   INTEGER NOT NULL DEFAULT 0,
     listen_received_count INTEGER NOT NULL DEFAULT 0,
     listen_last_at      TEXT,
+    account_role        TEXT NOT NULL DEFAULT 'musician',
+    local_listen_enabled INTEGER NOT NULL DEFAULT 0,
+    local_listen_item_id TEXT,
     created_at          TEXT DEFAULT (datetime('now','localtime')),
     updated_at          TEXT DEFAULT (datetime('now','localtime'))
 );
@@ -51,6 +54,23 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_task_logs_account ON task_logs(account_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS local_listen_runs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    listener_account_id INTEGER NOT NULL,
+    target_account_id   INTEGER NOT NULL,
+    target_item_id      TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    message             TEXT,
+    created_at          TEXT DEFAULT (datetime('now','localtime')),
+    FOREIGN KEY (listener_account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+    FOREIGN KEY (target_account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_listen_runs_listener
+    ON local_listen_runs(listener_account_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_local_listen_runs_target
+    ON local_listen_runs(target_account_id, created_at);
 """
 
 
@@ -87,6 +107,9 @@ def init_db() -> None:
             "listen_play_count": "INTEGER NOT NULL DEFAULT 0",
             "listen_received_count": "INTEGER NOT NULL DEFAULT 0",
             "listen_last_at": "TEXT",
+            "account_role": "TEXT NOT NULL DEFAULT 'musician'",
+            "local_listen_enabled": "INTEGER NOT NULL DEFAULT 0",
+            "local_listen_item_id": "TEXT",
         }
         for name, definition in listen_columns.items():
             if name not in account_columns:

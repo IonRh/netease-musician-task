@@ -107,12 +107,11 @@ def run_listen(account_id: int) -> dict:
     if not api_url:
         return {"ok": False, "message": "未配置听歌 API 地址，请先点击「加入听歌」"}
 
-    from app.api.listen import _account_md5, _hourly_apikey, _server_url
+    from app.api.listen import _account_md5, _client_headers, _server_url
     from app.browser.tasks import do_listen_music
 
     account_md5 = _account_md5(acc["phone"])
-    apikey = _hourly_apikey(account_md5)
-    headers = {"X-API-Key": apikey}
+    headers = _client_headers(account_md5)
     try:
         next_resp = requests.get(
             _server_url(api_url, "/api/next"),
@@ -125,8 +124,10 @@ def run_listen(account_id: int) -> dict:
             return {"ok": False, "message": f"获取听歌任务失败：HTTP {next_resp.status_code}"}
         next_data = next_resp.json() or {}
         target = str(next_data.get("netease_item_id") or "").strip()
-        if not target:
-            return {"ok": False, "message": "听歌服务未返回歌曲 ID"}
+        task_id = str(next_data.get("task_id") or "").strip()
+        play_token = str(next_data.get("play_token") or "").strip()
+        if not target or not task_id or not play_token:
+            return {"ok": False, "message": "听歌服务未返回完整任务凭证"}
 
         repo.add_log(account_id, "listen", "info", f"开始播放歌曲：{target}")
         result = _run_blocking(do_listen_music, acc["profile_dir"], target, account_id)
@@ -141,7 +142,12 @@ def run_listen(account_id: int) -> dict:
 
         finish_resp = requests.post(
             _server_url(api_url, "/api/play/finish"),
-            json={"account_md5": account_md5, "netease_item_id": target},
+            json={
+                "account_md5": account_md5,
+                "netease_item_id": target,
+                "task_id": task_id,
+                "play_token": play_token,
+            },
             headers=headers,
             timeout=10,
         )
@@ -168,7 +174,12 @@ def run_listen(account_id: int) -> dict:
 def run_auto_listen_for_account(account_id: int) -> None:
     """在全局听歌开始时间执行已加入账号的每日听歌任务。"""
     acc = repo.get_account(account_id)
-    if not acc or not acc["enabled"] or acc.get("listen_status") != "normal":
+    if (
+        not acc
+        or not acc["enabled"]
+        or acc.get("account_role", "musician") != "musician"
+        or acc.get("listen_status") != "normal"
+    ):
         return
     if not (repo.get_setting("listen_api_url", "") or "").strip():
         return
@@ -195,6 +206,79 @@ def run_auto_listen_for_account(account_id: int) -> None:
             f"（今日 {today_count + completed}/{daily_max}，"
             f"本月 {month_count + completed}/{monthly_max}）",
         )
+
+
+# ---------- 本地账号互助听歌 ----------
+def _build_local_listen_jobs(account_id: int, limit: int) -> list[dict]:
+    from app.local_listen import parse_item_ids
+
+    states: list[dict] = []
+    for target in repo.list_local_listen_targets(account_id):
+        try:
+            items = parse_item_ids(target.get("local_listen_item_id"))
+        except ValueError:
+            continue
+        counts = repo.local_listen_item_success_counts(int(target["id"]))
+        states.append({"target": target, "items": items, "counts": counts})
+    jobs: list[dict] = []
+    for index in range(max(0, limit)):
+        if not states:
+            break
+        state = states[index % len(states)]
+        item_id = min(state["items"], key=lambda item: (state["counts"].get(item, 0), state["items"].index(item)))
+        state["counts"][item_id] = state["counts"].get(item_id, 0) + 1
+        jobs.append({"target": state["target"], "item_id": item_id})
+    return jobs
+
+
+def run_local_listen_batch(account_id: int, max_count: int) -> dict:
+    acc = repo.get_account(account_id)
+    if not acc or not acc.get("enabled") or not acc.get("local_listen_enabled"):
+        return {"ok": False, "message": "账号未启用本地互助"}
+    jobs = _build_local_listen_jobs(account_id, max_count)
+    if not jobs:
+        return {"ok": False, "message": "暂无其他已加入本地互助的账号"}
+    from app.browser.tasks import do_local_listen_music_batch
+
+    try:
+        result = _run_blocking(
+            do_local_listen_music_batch,
+            acc["profile_dir"],
+            [job["item_id"] for job in jobs],
+            account_id,
+            repo.get_setting_int("local_listen_play_percent", 34),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": str(exc)}
+    results = list(result.get("results") or [])
+    completed = 0
+    for index, item_result in enumerate(results[: len(jobs)]):
+        job = jobs[index]
+        ok = bool(item_result.get("ok"))
+        message = (
+            f"已帮助账号 #{job['target']['id']} 播放 {job['item_id']}"
+            if ok else f"播放 {job['item_id']} 失败：{item_result.get('message', '未知错误')}"
+        )
+        repo.add_local_listen_run(account_id, int(job["target"]["id"]), job["item_id"], "success" if ok else "fail", message)
+        repo.add_log(account_id, "local_listen", "success" if ok else "fail", message)
+        completed += int(ok)
+    return {**result, "ok": completed == len(jobs), "completed": completed, "requested": len(jobs), "message": f"完成 {completed}/{len(jobs)} 首"}
+
+
+def run_local_listen_to_limit(account_id: int) -> dict:
+    daily_max = max(0, repo.get_setting_int("local_listen_daily_max", 25))
+    monthly_max = max(0, repo.get_setting_int("local_listen_monthly_max", 650))
+    remaining = min(
+        daily_max - repo.count_local_listen_successes(account_id, period="today"),
+        monthly_max - repo.count_local_listen_successes(account_id, period="month"),
+    )
+    if remaining <= 0:
+        return {"ok": True, "completed": 0, "message": "本地互助已达到今日或本月上限"}
+    return run_local_listen_batch(account_id, remaining)
+
+
+def run_auto_local_listen_for_account(account_id: int) -> None:
+    run_local_listen_to_limit(account_id)
 
 # ---------- 间隔任务（发布动态 / VIP 领取）----------
 def _month_tag() -> str:
@@ -287,7 +371,7 @@ def _emit_run(account_id: int, line: str) -> None:
 
 def _notify_manual_result(account_id: int, acc: dict, tasks: list[str], lines: list[str], *, ok: bool) -> None:
     """发送网页手动执行结果；通知失败不影响任务本身。"""
-    task_names = {"checkin": "签到", "publish": "发布动态", "vip": "领取 VIP", "listen": "听歌"}
+    task_names = {"checkin": "签到", "publish": "发布动态", "vip": "领取 VIP", "listen": "公共互助听歌", "local_listen": "本地互助听歌"}
     selected = "、".join(task_names[t] for t in tasks if t in task_names)
     account_name = account_label(account_id, account=acc)
     content = "\n".join([
@@ -312,7 +396,7 @@ def _notify_manual_result(account_id: int, acc: dict, tasks: list[str], lines: l
 def run_selected(account_id: int, tasks: list[str]) -> None:
     """
     手动执行选中的任务，全部在**同一浏览器会话**内完成（签到主标签页、间隔任务新标签页）。
-    tasks 取值：'checkin'（签到）、'publish'（发布动态）、'vip'（领取 VIP）。
+    tasks 取值：'checkin'、'publish'、'vip'、'listen'、'local_listen'。
     发布与 VIP 互斥，若同时勾选以 VIP 优先（同一次只做一种间隔任务）。
     """
     acc = repo.get_account(account_id)
@@ -325,6 +409,7 @@ def run_selected(account_id: int, tasks: list[str]) -> None:
     want_vip = "vip" in tasks
     want_publish = "publish" in tasks
     want_listen = "listen" in tasks
+    want_local_listen = "local_listen" in tasks
     run_interval = want_vip or want_publish
     interval_kind = "vip" if want_vip else "publish"
 
@@ -409,6 +494,12 @@ def run_selected(account_id: int, tasks: list[str]) -> None:
         all_ok = all_ok and listen_ok
         result_lines.append(f"听歌：{listen_result.get('message', '未完成')}")
 
+    if want_local_listen:
+        local_result = run_local_listen_to_limit(account_id)
+        local_ok = bool(local_result.get("ok"))
+        all_ok = all_ok and local_ok
+        result_lines.append(f"本地互助听歌：{local_result.get('message', '未完成')}")
+
     _notify_manual_result(account_id, acc, tasks, result_lines, ok=all_ok)
 
 
@@ -419,7 +510,7 @@ def run_daily_for_account(account_id: int) -> None:
     （VIP 可领取日领 VIP，否则达到间隔天数则发布动态），中途不关浏览器。
     """
     acc = repo.get_account(account_id)
-    if not acc or not acc["enabled"]:
+    if not acc or not acc["enabled"] or acc.get("account_role", "musician") != "musician":
         return
 
     from app.browser.tasks import do_daily_run

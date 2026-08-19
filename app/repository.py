@@ -101,6 +101,7 @@ def update_account(account_id: int, **fields) -> None:
         "further_vip_get_time", "last_send_date", "monthly_sends", "month_tag",
         "listen_api_url", "listen_item_id", "listen_status", "listen_error",
         "listen_play_count", "listen_received_count", "listen_last_at",
+        "account_role", "local_listen_enabled", "local_listen_item_id",
     }
     sets, vals = [], []
     for k, v in fields.items():
@@ -155,6 +156,73 @@ def count_success_logs_this_month(account_id: int, task_type: str) -> int:
             (account_id, task_type),
         ).fetchone()
         return int(row["total"] or 0)
+
+
+# ---------- 本地账号互助听歌 ----------
+def count_local_listen_successes(account_id: int, *, period: str, as_target: bool = False) -> int:
+    column = "target_account_id" if as_target else "listener_account_id"
+    where = {
+        "today": "date(created_at)=date('now','localtime')",
+        "month": "strftime('%Y-%m',created_at)=strftime('%Y-%m','now','localtime')",
+    }.get(period)
+    if not where:
+        raise ValueError("period must be today or month")
+    with db() as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS n FROM local_listen_runs WHERE {column}=? AND status='success' AND {where}",
+            (account_id,),
+        ).fetchone()
+        return int(row["n"] or 0)
+
+
+def list_local_listen_targets(listener_account_id: int) -> list[dict[str, Any]]:
+    """返回其他已加入本地互助的音乐人账号，优先选择今日被听较少的账号。"""
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT a.*, COUNT(r.id) AS received_today
+            FROM accounts a
+            LEFT JOIN local_listen_runs r
+              ON r.target_account_id=a.id AND r.status='success'
+             AND date(r.created_at)=date('now','localtime')
+            WHERE a.id<>? AND a.enabled=1 AND a.account_role='musician'
+              AND a.local_listen_enabled=1
+              AND COALESCE(TRIM(a.local_listen_item_id),'')<>''
+            GROUP BY a.id
+            ORDER BY received_today ASC, a.id ASC
+            """,
+            (listener_account_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def local_listen_item_success_counts(target_account_id: int) -> dict[str, int]:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT target_item_id, COUNT(*) AS n
+            FROM local_listen_runs
+            WHERE target_account_id=? AND status='success'
+              AND date(created_at)=date('now','localtime')
+            GROUP BY target_item_id
+            """,
+            (target_account_id,),
+        ).fetchall()
+        return {str(row["target_item_id"]): int(row["n"] or 0) for row in rows}
+
+
+def add_local_listen_run(
+    listener_account_id: int,
+    target_account_id: int,
+    target_item_id: str,
+    status: str,
+    message: str = "",
+) -> None:
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO local_listen_runs(listener_account_id,target_account_id,target_item_id,status,message) VALUES (?,?,?,?,?)",
+            (listener_account_id, target_account_id, target_item_id, status, message[:2000]),
+        )
 
 
 def list_logs(account_id: Optional[int] = None, limit: int = 100) -> list[dict[str, Any]]:

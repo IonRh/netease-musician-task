@@ -106,6 +106,11 @@ def active_info() -> Optional[dict]:
             return None
         return {"account_id": _active.account_id, "label": _active.label, "pid": _active.pid}
 
+def is_current_task(account_id: Optional[int]) -> bool:
+    """判断浏览器任务是否仍属于指定账号。"""
+    with _lock:
+        return _active is not None and _active.account_id == account_id
+
 
 def force_stop(account_id: Optional[int] = None) -> bool:
     """

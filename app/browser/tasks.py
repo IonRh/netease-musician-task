@@ -292,6 +292,79 @@ def do_listen_music(
         _emit(account_id, f"听歌超时：{item_id}", "warn")
         return {"ok": False, "message": "播放超时"}
 
+
+def _listen_local_item_on_page(
+    page: Page,
+    item_id: str,
+    account_id: Optional[int],
+    play_percent: int,
+    timeout_seconds: int,
+) -> dict:
+    item_kind, target_id = "song", str(item_id).strip()
+    if target_id.startswith("album:"):
+        item_kind, target_id = "album", target_id[6:].strip()
+    if not target_id.isdigit():
+        return {"ok": False, "item_id": item_id, "message": "无效的歌曲/专辑 ID"}
+    page.goto(f"https://music.163.com/#/{item_kind}?id={target_id}", wait_until="domcontentloaded")
+    page.wait_for_timeout(3000)
+    if not _click_play_controls(page, force=True):
+        return {"ok": False, "item_id": item_id, "message": "未找到可用的播放按钮"}
+    deadline = time.time() + timeout_seconds
+    last_log = 0.0
+    while time.time() < deadline:
+        from app.browser import registry
+
+        if page.is_closed() or not registry.is_current_task(account_id):
+            return {"ok": False, "stopped": True, "item_id": item_id, "message": "任务已停止"}
+        state = _read_playback_state(page)
+        cur, dur = float(state.get("cur", 0)), float(state.get("dur", 0))
+        required = min(dur, dur * max(34, min(100, play_percent)) / 100 + 5000) if dur > 0 else 0
+        if required > 0 and cur >= required:
+            _emit(account_id, f"本地互助计次完成：{item_id}（已播放 {cur / 1000:.0f}/{dur / 1000:.0f} 秒）")
+            return {"ok": True, "item_id": item_id, "played_ms": int(cur), "duration_ms": int(dur)}
+        if state.get("state") in {"paused", "stop"}:
+            _click_play_controls(page)
+        if time.time() - last_log >= 15:
+            _emit(account_id, f"本地互助播放中：{item_id}，进度 {cur / 1000:.0f}/{dur / 1000:.0f} 秒")
+            last_log = time.time()
+        time.sleep(2)
+    return {"ok": False, "item_id": item_id, "message": "播放超时"}
+
+
+def do_local_listen_music_batch(
+    profile_dir: str,
+    netease_item_ids: list[str],
+    account_id: Optional[int] = None,
+    play_percent: int = 34,
+    timeout_seconds: int = 1200,
+) -> dict:
+    """在同一个浏览器会话中依次播放本地互助目标。"""
+    item_ids = [str(item).strip() for item in netease_item_ids if str(item).strip()]
+    if not item_ids:
+        return {"ok": False, "results": [], "message": "没有可播放的歌曲"}
+    bus.status(account_id, "running", f"本地互助批量播放：{len(item_ids)} 首")
+    results: list[dict] = []
+    with run_with_context(profile_dir, account_id=account_id, label="本地互助听歌") as (context, page):
+        if not _validate_session(page, account_id):
+            return {"ok": False, "auth_valid": False, "results": [], "message": "cookie expired"}
+        current_page = page
+        for index, item_id in enumerate(item_ids):
+            if index:
+                next_page = context.new_page()
+                try:
+                    current_page.close()
+                except Exception:
+                    pass
+                current_page = next_page
+            _emit(account_id, f"本地互助第 {index + 1}/{len(item_ids)} 首：{item_id}")
+            result = _listen_local_item_on_page(current_page, item_id, account_id, play_percent, timeout_seconds)
+            results.append(result)
+            if result.get("stopped"):
+                break
+    completed = sum(1 for result in results if result.get("ok"))
+    bus.status(account_id, "done", f"本地互助完成：{completed}/{len(item_ids)} 首")
+    return {"ok": completed == len(item_ids), "auth_valid": True, "results": results, "message": f"完成 {completed}/{len(item_ids)} 首"}
+
 # ---------- 每日整体流程（签到 +（可选）间隔任务，同一浏览器不关闭）----------
 def do_daily_run(
     profile_dir: str,

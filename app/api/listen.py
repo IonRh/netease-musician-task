@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -55,9 +54,17 @@ def _account_md5(phone: str) -> str:
     return hashlib.md5(phone.strip().encode("utf-8")).hexdigest()
 
 
-def _hourly_apikey(account_md5: str) -> str:
-    time_part = datetime.now().strftime("%Y%m%d%H")
-    return hashlib.md5(f"{account_md5}{time_part}".encode("utf-8")).hexdigest()
+def _client_headers(account_md5: str, *, content_type: bool = False) -> dict[str, str]:
+    token = (repo.get_setting("listen_client_token", "") or "").strip()
+    if not token:
+        raise HTTPException(422, "请先在全局设置中填写互助客户端 Token")
+    headers = {
+        "X-Client-Token": token,
+        "X-Account-MD5": account_md5,
+    }
+    if content_type:
+        headers["Content-Type"] = "application/json"
+    return headers
 
 
 def _response_detail(resp: requests.Response) -> str:
@@ -80,19 +87,17 @@ def join_listen(body: JoinListenRequest) -> dict:
     item_id = body.netease_item_id.strip()
     repo.set_setting("listen_api_url", api_url)
     account_md5 = _account_md5(account["phone"])
-    apikey = _hourly_apikey(account_md5)
     daily_limit = repo.get_setting_int("listen_daily_max", 1)
     monthly_limit = repo.get_setting_int("listen_monthly_max", 30)
     join_url = _server_url(body.api_url, "/api/join")
     update_url = _server_url(body.api_url, "/api/update")
-    headers = {"X-API-Key": apikey, "Content-Type": "application/json"}
+    headers = _client_headers(account_md5, content_type=True)
 
     try:
         join_resp = requests.post(
             join_url,
             json={
                 "account_md5": account_md5,
-                "apikey": apikey,
                 "daily_listen_limit": max(0, daily_limit),
                 "monthly_listen_limit": max(0, monthly_limit),
             },
@@ -158,7 +163,7 @@ def listen_status(account_id: int) -> dict:
         return {"ok": True, "listen": _local_listen_status(account)}
 
     account_md5 = _account_md5(account["phone"])
-    headers = {"X-API-Key": _hourly_apikey(account_md5)}
+    headers = _client_headers(account_md5)
     try:
         resp = requests.get(
             _server_url(api_url, f"/api/listen-records/{account_md5}"),
@@ -222,7 +227,7 @@ def leave_listen(account_id: int) -> dict:
         return {"ok": True}
 
     account_md5 = _account_md5(account["phone"])
-    headers = {"X-API-Key": _hourly_apikey(account_md5)}
+    headers = _client_headers(account_md5)
     try:
         resp = requests.delete(
             _server_url(api_url, f"/api/listen-records/{account_md5}"),
@@ -267,8 +272,7 @@ def sync_listen_config() -> dict:
         account_id = int(account["id"])
         account_md5 = _account_md5(account["phone"])
         headers = {
-            "X-API-Key": _hourly_apikey(account_md5),
-            "Content-Type": "application/json",
+            **_client_headers(account_md5, content_type=True),
         }
         try:
             resp = requests.post(

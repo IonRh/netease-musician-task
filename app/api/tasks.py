@@ -12,7 +12,7 @@ from app.logging_conf import logger
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
-_VALID_TASKS = {"checkin", "publish", "vip", "listen"}
+_VALID_TASKS = {"checkin", "publish", "vip", "listen", "local_listen"}
 _TASK_ALIASES = {"publishing": "publish"}  # 兼容修复前的网页缓存
 
 
@@ -22,13 +22,18 @@ class RunSelection(BaseModel):
 
 @router.post("/{account_id}/run")
 def run_selected(account_id: int, body: RunSelection) -> dict:
-    if not repo.get_account(account_id):
+    account = repo.get_account(account_id)
+    if not account:
         raise HTTPException(404, "账号不存在")
     normalized = [_TASK_ALIASES.get(t, t) for t in body.tasks]
     # 去重并保持用户勾选顺序。
     tasks = list(dict.fromkeys(t for t in normalized if t in _VALID_TASKS))
     if not tasks:
         raise HTTPException(400, "请至少选择一项任务")
+    if account.get("account_role", "musician") == "player" and any(
+        task != "local_listen" for task in tasks
+    ):
+        raise HTTPException(400, "普通播放账号只能执行本地互助听歌")
 
     def _bg() -> None:
         try:
